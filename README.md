@@ -4,7 +4,7 @@ I got tired of manually splitting MP3s from albums I could only find on youtube.
 
 **Installation:**
 
-1. `pip install requirements.txt`
+1. `pip install -r requirements.txt`
 
 2. You will need ffmpeg to make this work:
 

@@ -1,4 +1,5 @@
-yt-dlp 
+yt-dlp
 pygame
 pillow
 requests
+mutagen
