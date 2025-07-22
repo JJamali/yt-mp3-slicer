@@ -2,6 +2,7 @@
 
 
 pip install yt-dlp
+pip install yt-dlp pygame
 
 
 You need ffmpeg to make this work
