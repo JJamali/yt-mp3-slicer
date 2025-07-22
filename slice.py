@@ -8,9 +8,8 @@ import os
 import re
 import sys
 import subprocess
-from typing import List, Tuple, Optional
+from typing import List, Optional
 import yt_dlp
-from datetime import datetime, timedelta
 
 class Track:
     def __init__(self, title: str, start_time: str, end_time: str = None):
@@ -61,9 +60,11 @@ class YouTubeAlbumSplitter:
         
         # Common patterns for timestamps in descriptions
         patterns = [
-            r'(\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—]\s*(.+)',  # 1:23 - Song Title
-            r'(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)',          # 1:23 Song Title
-            r'(.+?)\s*[-–—]\s*(\d{1,2}:\d{2}(?::\d{2})?)', # Song Title - 1:23
+            r'(\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—]\s*(.+?)\s*[-–—]\s*(\d{1,2}:\d{2}(?::\d{2})?)',  # 1:23 - Song Title - 4:56
+            r'(\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—]\s*(.+)',     # 1:23 - Song Title
+            r'(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)',             # 1:23 Song Title
+            r'(.+?)\s*[-–—]\s*(\d{1,2}:\d{2}(?::\d{2})?)',    # Song Title - 1:23
+            r'(.+?):\s*(\d{1,2}:\d{2}(?::\d{2})?)',           # Song Title: 1:23
         ]
         
         lines = description.split('\n')
@@ -72,34 +73,57 @@ class YouTubeAlbumSplitter:
             line = line.strip()
             if not line:
                 continue
+            
+            # Skip obvious non-track lines
+            if any(skip_word in line.lower() for skip_word in ['tracklist', 'track list', 'playlist', 'setlist']):
+                continue
                 
             for pattern in patterns:
-                matches = re.findall(pattern, line)
+                matches = re.findall(pattern, line, re.UNICODE)
                 for match in matches:
-                    if pattern.endswith(r'(\d{1,2}:\d{2}(?::\d{2})?)'):
-                        # Title comes first
-                        title, timestamp = match
-                    else:
-                        # Timestamp comes first
-                        timestamp, title = match
+                    if len(match) == 3:  # Full format with both timestamps
+                        start_time, title, end_time = match
+                        title = title.strip()
+                    elif pattern.startswith(r'(\d'):  # Timestamp comes first
+                        timestamp, title = match[:2]
+                        if ' - ' in line or ' – ' in line:  # Likely has both timestamps
+                            continue  # Skip partial matches when full pattern might exist
+                        start_time = timestamp
+                        end_time = None
+                    else:  # Title comes first
+                        title, timestamp = match[:2]
+                        start_time = timestamp
+                        end_time = None
                     
                     # Clean up the title
                     title = re.sub(r'^[\d\.\)\]\-–—\s]+', '', title).strip()
                     title = re.sub(r'[\[\(].*?[\]\)]', '', title).strip()
+                    title = title.strip('「」『』""''')  # Remove Japanese quotation marks
+                    title = title.strip()
                     
-                    if title and len(title) > 2:  # Reasonable title length
-                        try:
-                            self.parse_timestamp(timestamp)  # Validate timestamp
-                            tracks.append(Track(title, timestamp))
-                        except ValueError:
-                            continue
+                    # Skip empty titles or just numbers
+                    if not title or title.isdigit():
+                        continue
+                    
+                    try:
+                        self.parse_timestamp(start_time)  # Validate
+                        if end_time:
+                            self.parse_timestamp(end_time)  # Validate
+                        
+                        # Only add if we haven't seen this exact track already
+                        if not any(t.title == title and t.start_time == start_time for t in tracks):
+                            tracks.append(Track(title, start_time, end_time))
+                        break  # Found a match for this line, move to next line
+                    except ValueError:
+                        continue
         
         # Sort tracks by timestamp
         tracks.sort(key=lambda t: self.parse_timestamp(t.start_time))
         
-        # Add end times
-        for i in range(len(tracks) - 1):
-            tracks[i].end_time = tracks[i + 1].start_time
+        # Fill in missing end times
+        for i in range(len(tracks)):
+            if not tracks[i].end_time and i < len(tracks) - 1:
+                tracks[i].end_time = tracks[i + 1].start_time
         
         return tracks
     
@@ -113,27 +137,48 @@ class YouTubeAlbumSplitter:
             'audioformat': 'mp3',
             'outtmpl': 'temp_audio.%(ext)s',
             'quiet': True,
+            'nooverwrites': True,
+            'continuedl': True,
+            'retries': 10,
+            'fragment-retries': 10,
+            'skip-unavailable-fragments': True,
+            'extractor-args': 'youtube:player_client=android',
+            'http-chunk-size': '1M',
         }
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Get video info
-            self.video_info = ydl.extract_info(url, download=False)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Get video info first
+                try:
+                    self.video_info = ydl.extract_info(url, download=False)
+                except Exception as e:
+                    print(f"Error getting video info: {e}")
+                    raise
+                
+                # Try downloading with different options if first attempt fails
+                try:
+                    ydl.download([url])
+                except yt_dlp.utils.DownloadError as e:
+                    print("First download attempt failed, trying alternative method...")
+                    # Try with different parameters
+                    ydl_opts['extractor-args'] = 'youtube:player_client=web'
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([url])
             
-            # Download audio
-            ydl.download([url])
+            # Find the downloaded file
+            for file in os.listdir('.'):
+                if file.startswith('temp_audio'):
+                    self.audio_file = file
+                    break
+            
+            if not self.audio_file:
+                raise Exception("Failed to download audio file")
+            
+            print(f"Audio downloaded: {self.audio_file}")
+            return self.audio_file
+        except Exception as e:
+            raise Exception(f"Failed to download audio: {e}")
         
-        # Find the downloaded file
-        for file in os.listdir('.'):
-            if file.startswith('temp_audio'):
-                self.audio_file = file
-                break
-        
-        if not self.audio_file:
-            raise Exception("Failed to download audio file")
-        
-        print(f"Audio downloaded: {self.audio_file}")
-        return self.audio_file
-    
     def split_audio(self, tracks: List[Track], output_dir: str = "output"):
         """Split audio file into individual tracks"""
         if not os.path.exists(output_dir):
