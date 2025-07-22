@@ -15,7 +15,9 @@ import threading
 import tempfile
 import pygame
 import yt_dlp
-import time
+import requests
+from io import BytesIO
+from PIL import Image, ImageTk
 
 class Track:
     def __init__(self, title: str, start_time: str, end_time: str = None):
@@ -432,6 +434,7 @@ class YouTubeAlbumSplitterGUI:
         # Initialize pygame mixer
         pygame.mixer.init()
         
+        self.thumbnail_label = None
         self.setup_ui()
 
     def setup_ui(self):
@@ -459,6 +462,12 @@ class YouTubeAlbumSplitterGUI:
         self.status_var = tk.StringVar(value="Ready")
         status_label = ttk.Label(main_frame, textvariable=self.status_var)
         status_label.grid(row=2, column=0, columnspan=2, pady=(0, 10))
+
+        # Thumbnail display
+        thumbnail_frame = ttk.Frame(main_frame)
+        thumbnail_frame.grid(row=1, column=0, columnspan=2, pady=(0, 10))
+        self.thumbnail_label = ttk.Label(thumbnail_frame)
+        self.thumbnail_label.pack()
         
         # Tracks frame
         tracks_frame = ttk.LabelFrame(main_frame, text="Tracks", padding="5")
@@ -547,7 +556,8 @@ class YouTubeAlbumSplitterGUI:
                 self.root.after(0, lambda: self.download_btn.config(state='normal'))
                 self.root.after(0, lambda: self.process_btn.config(state='normal'))
                 update_status(f"Found {len(auto_tracks)} tracks")
-                
+                self.root.after(0, self.fetch_thumbnail)
+
             except Exception as e:
                 self.root.after(0, lambda: self.progress.stop())
                 self.root.after(0, lambda: self.download_btn.config(state='normal'))
@@ -673,6 +683,37 @@ class YouTubeAlbumSplitterGUI:
         
         threading.Thread(target=preview_thread, daemon=True).start()
     
+    def fetch_thumbnail(self):
+        if not self.splitter.video_info:
+            return
+
+        try:
+            # Get the highest resolution thumbnail
+            thumbnail_url = self.splitter.video_info.get('thumbnail')
+            if not thumbnail_url:
+                return
+
+            # Download and resize thumbnail
+            response = requests.get(thumbnail_url, stream=True)
+            response.raise_for_status()
+            
+            img_data = response.content
+            img = Image.open(BytesIO(img_data))
+            
+            # Resize to fit GUI (adjust dimensions as needed)
+            img.thumbnail((320, 180))
+            
+            # Convert for Tkinter
+            photo = ImageTk.PhotoImage(img)
+            
+            # Update label
+            self.thumbnail_label.config(image=photo)
+            self.thumbnail_label.image = photo  # Keep reference
+            
+        except Exception as e:
+            print(f"Error loading thumbnail: {e}")
+
+
     def stop_preview(self):
         self.player_controls.stop_playback()
         self.preview.stop_preview()
@@ -784,7 +825,7 @@ def main():
         import pygame
     except ImportError as e:
         print(f"Missing dependency: {e}")
-        print("Install with: pip install yt-dlp pygame")
+        print("Install with: pip install requirements.txt")
         sys.exit(1)
     
     # Check for ffmpeg
