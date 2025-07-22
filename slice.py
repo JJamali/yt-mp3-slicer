@@ -9,8 +9,8 @@ import re
 import sys
 import subprocess
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
-from typing import List, Optional
+from tkinter import ttk, filedialog, messagebox
+from typing import List
 import threading
 import tempfile
 import pygame
