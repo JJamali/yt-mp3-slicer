@@ -18,6 +18,8 @@ import yt_dlp
 import requests
 from io import BytesIO
 from PIL import Image, ImageTk
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, APIC, TIT2, TALB, TPE1
 
 class Track:
     def __init__(self, title: str, start_time: str, end_time: str = None):
@@ -178,20 +180,30 @@ class YouTubeAlbumSplitter:
             raise Exception(f"Failed to download audio: {e}")
         
     def split_audio(self, tracks: List[Track], output_dir: str = "output", progress_callback=None):
-        """Split audio file into individual tracks"""
+        """Split audio file into individual tracks with thumbnails"""
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-        
+
+        # Download thumbnail once
+        thumbnail_data = None
+        if self.video_info and 'thumbnail' in self.video_info:
+            try:
+                response = requests.get(self.video_info['thumbnail'])
+                thumbnail_data = response.content
+            except Exception as e:
+                print(f"Couldn't download thumbnail: {e}")
+
         for i, track in enumerate(tracks, 1):
             if progress_callback:
                 progress_callback(f"Processing track {i}/{len(tracks)}: {track.title}")
-            
+
             start_seconds = self.parse_timestamp(track.start_time)
             
             safe_title = re.sub(r'[<>:"/\\|?*]', '', track.title)
             safe_title = safe_title[:100]
             output_file = os.path.join(output_dir, f"{i:02d}. {safe_title}.mp3")
-            
+
+            # Split audio (same as before)
             cmd = [
                 'ffmpeg', '-i', self.audio_file,
                 '-ss', str(start_seconds),
@@ -211,9 +223,43 @@ class YouTubeAlbumSplitter:
             
             try:
                 subprocess.run(cmd, check=True, capture_output=True)
+                
+                # Add metadata and thumbnail
+                if thumbnail_data:
+                    self.add_mp3_metadata(output_file, track.title, thumbnail_data)
+                    
             except subprocess.CalledProcessError as e:
                 raise Exception(f"Failed to create {track.title}: {e.stderr.decode()}")
     
+    def add_mp3_metadata(self, filepath: str, title: str, thumbnail_data: bytes):
+        """Add ID3 tags and thumbnail to MP3 file. Cause I like doing that."""
+        try:
+            audio = MP3(filepath, ID3=ID3)
+            
+            # Add ID3 tag if it doesn't exist
+            try:
+                audio.add_tags()
+            except:
+                pass
+            
+            # Add thumbnail (album art)
+            audio.tags.add(APIC(
+                encoding=3,  # UTF-8
+                mime='image/jpeg',
+                type=3,      # Cover image
+                desc='Cover',
+                data=thumbnail_data
+            ))
+            
+            # Add basic metadata
+            audio.tags.add(TIT2(encoding=3, text=title))  # Title
+            audio.tags.add(TALB(encoding=3, text="YouTube Album"))  # Album
+            audio.tags.add(TPE1(encoding=3, text="Various Artists"))  # Artist
+            
+            audio.save()
+        except Exception as e:
+            print(f"Couldn't add metadata to {filepath}: {e}")
+
     def cleanup(self):
         """Remove temporary files"""
         if self.audio_file and os.path.exists(self.audio_file):
