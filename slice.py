@@ -15,6 +15,7 @@ import threading
 import tempfile
 import pygame
 import yt_dlp
+import time
 
 class Track:
     def __init__(self, title: str, start_time: str, end_time: str = None):
@@ -261,18 +262,178 @@ class AudioPreview:
                 pass
         self.current_preview = None
 
+class AudioPlayerControl(ttk.Frame):
+    def __init__(self, parent, preview_manager):
+        super().__init__(parent)
+        self.preview = preview_manager
+        self.is_playing = False
+        self.current_position = 0
+        self.duration = 0
+        self.setup_ui()
+        self.update_interval = 250  # ms
+        self.after_id = None
+
+    def setup_ui(self):
+        # Playback controls
+        self.play_btn = ttk.Button(self, text="▶", width=3, command=self.toggle_playback)
+        self.play_btn.grid(row=0, column=0, padx=5)
+        
+        self.stop_btn = ttk.Button(self, text="■", width=3, command=self.stop_playback)
+        self.stop_btn.grid(row=0, column=1, padx=5)
+        
+        # Time display
+        self.time_var = tk.StringVar(value="00:00 / 00:00")
+        ttk.Label(self, textvariable=self.time_var).grid(row=0, column=2, padx=10)
+        
+        # Seek slider
+        self.seek_var = tk.DoubleVar(value=0)
+        self.seek_slider = ttk.Scale(
+            self, 
+            from_=0, 
+            to=100, 
+            variable=self.seek_var, 
+            command=self.on_seek,
+            length=300
+        )
+        self.seek_slider.grid(row=0, column=3, padx=10)
+        
+        # Volume control
+        self.volume_var = tk.DoubleVar(value=70)
+        self.volume_slider = ttk.Scale(
+            self,
+            from_=0,
+            to=100,
+            variable=self.volume_var,
+            command=self.on_volume_change,
+            length=100,
+            orient=tk.HORIZONTAL
+        )
+        self.volume_slider.grid(row=0, column=4, padx=10)
+        
+        # Volume icon
+        self.volume_icon = ttk.Label(self, text="🔊")
+        self.volume_icon.grid(row=0, column=5, padx=5)
+        
+        # Set initial volume
+        pygame.mixer.music.set_volume(self.volume_var.get() / 100)
+        
+        # Configure grid weights
+        self.columnconfigure(3, weight=1)
+
+    def toggle_playback(self):
+        if self.is_playing:
+            self.pause_playback()
+        else:
+            self.start_playback()
+
+    def start_playback(self):
+        if not pygame.mixer.music.get_busy():
+            pygame.mixer.music.play()
+        else:
+            pygame.mixer.music.unpause()
+        
+        self.is_playing = True
+        self.play_btn.config(text="❚❚")  # Pause symbol
+        self.update_playback_position()
+
+    def pause_playback(self):
+        pygame.mixer.music.pause()
+        self.is_playing = False
+        self.play_btn.config(text="▶")
+        if self.after_id:
+            self.after_cancel(self.after_id)
+            self.after_id = None
+
+    def stop_playback(self):
+        pygame.mixer.music.stop()
+        self.is_playing = False
+        self.play_btn.config(text="▶")
+        self.current_position = 0
+        self.seek_var.set(0)
+        self.update_time_display()
+        if self.after_id:
+            self.after_cancel(self.after_id)
+            self.after_id = None
+
+    def on_seek(self, value):
+        if not self.preview.current_preview:
+            return
+            
+        seek_pos = float(value)
+        if self.duration > 0:
+            new_pos = (seek_pos / 100) * self.duration
+            pygame.mixer.music.set_pos(new_pos)
+            self.current_position = new_pos
+            self.update_time_display()
+
+    def on_volume_change(self, value):
+        volume = float(value) / 100
+        pygame.mixer.music.set_volume(volume)
+        # Update volume icon based on level
+        if volume == 0:
+            self.volume_icon.config(text="🔇")
+        elif volume < 0.3:
+            self.volume_icon.config(text="🔈")
+        elif volume < 0.6:
+            self.volume_icon.config(text="🔉")
+        else:
+            self.volume_icon.config(text="🔊")
+
+    def update_playback_position(self):
+        if pygame.mixer.music.get_busy():
+            # Get current position (pygame doesn't provide this directly, so we estimate)
+            self.current_position += self.update_interval / 1000
+            if self.current_position > self.duration:
+                self.current_position = self.duration
+                self.stop_playback()
+            
+            # Update seek slider
+            if self.duration > 0:
+                self.seek_var.set((self.current_position / self.duration) * 100)
+            
+            self.update_time_display()
+            self.after_id = self.after(self.update_interval, self.update_playback_position)
+        else:
+            self.stop_playback()
+
+    def update_time_display(self):
+        current_str = self.format_time(self.current_position)
+        duration_str = self.format_time(self.duration)
+        self.time_var.set(f"{current_str} / {duration_str}")
+
+    def format_time(self, seconds):
+        minutes = int(seconds // 60)
+        seconds = int(seconds % 60)
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def set_duration(self, duration):
+        self.duration = duration
+        self.current_position = 0
+        self.seek_var.set(0)
+        self.update_time_display()
+
+    def reset(self):
+        self.stop_playback()
+        self.duration = 0
+        self.current_position = 0
+        self.seek_var.set(0)
+        self.update_time_display()
+
 class YouTubeAlbumSplitterGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("YouTube Album Splitter")
-        self.root.geometry("1000x700")
+        self.root.geometry("1000x750")  # Slightly taller for player controls
         
         self.splitter = YouTubeAlbumSplitter()
         self.preview = AudioPreview()
         self.tracks = []
         
+        # Initialize pygame mixer
+        pygame.mixer.init()
+        
         self.setup_ui()
-    
+
     def setup_ui(self):
         # Main frame
         main_frame = ttk.Frame(self.root, padding="10")
@@ -356,6 +517,9 @@ class YouTubeAlbumSplitterGUI:
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(3, weight=1)
+
+        self.player_controls = AudioPlayerControl(main_frame, self.preview)
+        self.player_controls.grid(row=6, column=0, columnspan=2, pady=(10, 0), sticky=(tk.W, tk.E))
     
     def download_and_analyze(self):
         url = self.url_var.get().strip()
@@ -488,12 +652,19 @@ class YouTubeAlbumSplitterGUI:
         def preview_thread():
             try:
                 start_sec = self.splitter.parse_timestamp(track.start_time)
+                end_sec = self.splitter.parse_timestamp(track.end_time) if track.end_time else start_sec + 30
+                duration = end_sec - start_sec
+                
                 self.root.after(0, lambda: self.status_var.set("Creating preview..."))
                 
-                preview_file = self.preview.create_preview(self.splitter.audio_file, start_sec)
+                preview_file = self.preview.create_preview(self.splitter.audio_file, start_sec, duration)
                 if preview_file:
                     self.preview.current_preview = preview_file
                     self.preview.play_preview(preview_file)
+                    
+                    # Update player controls
+                    self.root.after(0, lambda: self.player_controls.set_duration(duration))
+                    self.root.after(0, lambda: self.player_controls.start_playback())
                     self.root.after(0, lambda: self.status_var.set(f"Playing preview: {track.title}"))
                 else:
                     self.root.after(0, lambda: messagebox.showerror("Error", "Failed to create preview"))
@@ -503,6 +674,7 @@ class YouTubeAlbumSplitterGUI:
         threading.Thread(target=preview_thread, daemon=True).start()
     
     def stop_preview(self):
+        self.player_controls.stop_playback()
         self.preview.stop_preview()
         self.status_var.set("Preview stopped")
     
