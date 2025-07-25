@@ -339,6 +339,10 @@ class AudioPlayerControl(ttk.Frame):
             self.root_gui_ref.status_var.set("Please download audio first to preview tracks.")
             return
 
+        # Start a new thread for ffmpeg processing to avoid blocking the GUI
+        threading.Thread(target=self._load_track_in_thread, args=(track,), daemon=True).start()
+
+    def _load_track_in_thread(self, track: Track):
         try:
             start_sec = self.root_gui_ref.splitter.parse_timestamp(track.start_time)
             
@@ -347,25 +351,20 @@ class AudioPlayerControl(ttk.Frame):
             if track.end_time:
                 end_sec_for_preview = self.root_gui_ref.splitter.parse_timestamp(track.end_time)
             else:
-                # If no explicit end time, determine the end of the full audio file
-                # Use mutagen to get the total duration of the downloaded audio file
                 full_audio = MP3(self.root_gui_ref.splitter.audio_file)
                 end_sec_for_preview = int(full_audio.info.length)
 
-            # Calculate the duration for the preview
             if end_sec_for_preview is not None:
                 preview_length_sec = end_sec_for_preview - start_sec
             else:
-                # This case should ideally not happen if end_sec_for_preview is always set.
-                # As a fallback, use remaining duration from start_sec to end of whole audio.
                 full_audio = MP3(self.root_gui_ref.splitter.audio_file)
                 preview_length_sec = int(full_audio.info.length) - start_sec
 
             if preview_length_sec <= 0:
-                self.root_gui_ref.status_var.set("Track has zero or negative duration. Cannot preview.")
+                self.root_gui_ref.root.after(0, lambda: self.root_gui_ref.status_var.set("Track has zero or negative duration. Cannot preview."))
                 return
 
-            self.root_gui_ref.status_var.set(f"Creating preview for: {track.title}...")
+            self.root_gui_ref.root.after(0, lambda: self.root_gui_ref.status_var.set(f"Creating preview for: {track.title}... (this may take a moment)"))
             
             # Create a temporary preview file
             self.preview_file = tempfile.mktemp(suffix='.mp3')
@@ -380,22 +379,32 @@ class AudioPlayerControl(ttk.Frame):
             # Removed creationflags=subprocess.CREATE_NO_WINDOW
             subprocess.run(cmd, check=True, capture_output=True) 
             
+            # Load and prepare playback in the main thread
+            self.root_gui_ref.root.after(0, lambda: self._finalize_playback_load(preview_length_sec, track.title))
+
+        except subprocess.CalledProcessError as e:
+            self.root_gui_ref.root.after(0, lambda: messagebox.showerror("Error", f"Failed to create preview: {e.stderr.decode()}"))
+            self.root_gui_ref.root.after(0, self.reset)
+            self.root_gui_ref.root.after(0, lambda: self.root_gui_ref.status_var.set("Error creating preview."))
+        except Exception as e:
+            self.root_gui_ref.root.after(0, lambda: messagebox.showerror("Error", f"Error loading track for playback: {e}"))
+            self.root_gui_ref.root.after(0, self.reset)
+            self.root_gui_ref.root.after(0, lambda: self.root_gui_ref.status_var.set("Error loading track."))
+
+    def _finalize_playback_load(self, preview_length_sec: int, track_title: str):
+        """Called in the main thread after ffmpeg completes in the background."""
+        try:
             pygame.mixer.music.load(self.preview_file)
             self.set_duration(preview_length_sec) # Set duration for slider
             self.play_btn.config(text="▶") # Set to play symbol
             self.current_position = 0
             self.seek_var.set(0)
             self.update_time_display()
-            self.root_gui_ref.status_var.set(f"Loaded for playback: {track.title}")
-
-        except subprocess.CalledProcessError as e:
-            messagebox.showerror("Error", f"Failed to create preview: {e.stderr.decode()}")
-            self.reset()
-            self.root_gui_ref.status_var.set("Error creating preview.")
+            self.root_gui_ref.status_var.set(f"Loaded for playback: {track_title}")
         except Exception as e:
-            messagebox.showerror("Error", f"Error loading track for playback: {e}")
+            messagebox.showerror("Error", f"Error finalizing playback: {e}")
             self.reset()
-            self.root_gui_ref.status_var.set("Error loading track.")
+            self.root_gui_ref.status_var.set("Error finalizing playback.")
 
     def toggle_playback(self):
         if self.preview_file is None:
