@@ -1054,6 +1054,7 @@ class YouTubeAlbumSplitterGUI:
         self.url_var = tk.StringVar()
         url_entry = ttk.Entry(url_frame, textvariable=self.url_var, width=60)
         url_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
+        url_entry.focus_set()
 
         # Bind Enter key to the button click
         url_entry.bind("<Return>", lambda event: self.download_btn.invoke())
