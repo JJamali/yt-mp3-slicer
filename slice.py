@@ -59,16 +59,34 @@ class YouTubeAlbumSplitter:
             return f"{minutes:02d}:{secs:02d}"
     
     def extract_timestamps_from_description(self, description: str) -> List[Track]:
-        """Extract track information from video description"""
+        """
+        Extract track information from video description.
+        Improved logic to handle various formats including timestamp before or after title,
+        and Japanese characters/symbols.
+        """
         tracks = []
         
-        patterns = [
-            r'(\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—]\s*(.+?)\s*[-–—]\s*(\d{1,2}:\d{2}(?::\d{2})?)',
-            r'(\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—]\s*(.+)',
-            r'(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)',
-            r'(.+?)\s*[-–—]\s*(\d{1,2}:\d{2}(?::\d{2})?)',
-            r'(.+?):\s*(\d{1,2}:\d{2}(?::\d{2})?)',
-        ]
+        # Define patterns for different common formats
+        # Pattern 1: Track number (optional), Title, Timestamp, optional trailing ~
+        # Example: "１.愛のゆくえ 0:03〜", "1 - The Sea 00:00"
+        # Group 1: Title, Group 2: Timestamp
+        pattern_title_before_ts = re.compile(
+            r'^(?:[０-９]+\.?\s*[-–—]?\s*)?'  # Optional leading track number (half/full-width), period, space, hyphen
+            r'(.+?)'                          # Non-greedy capture of the title
+            r'\s*(\d{1,2}:\d{2}(?::\d{2})?)'  # Capture the timestamp
+            r'\s*[-–—~〜]?\s*$'               # Optional separators and whitespace at end
+            , re.UNICODE
+        )
+
+        # Pattern 2: Timestamp, optional separators, Title
+        # Example: "00:00 - The Sea", "05:31 Natsuno Yoru no Machi"
+        # Group 1: Timestamp, Group 2: Title
+        pattern_ts_before_title = re.compile(
+            r'(\d{1,2}:\d{2}(?::\d{2})?)'  # Capture the timestamp
+            r'\s*[-–—~〜]?\s*'             # Optional separators and whitespace
+            r'(.+)'                        # Capture the rest of the line as title
+            , re.UNICODE
+        )
         
         lines = description.split('\n')
         
@@ -77,50 +95,60 @@ class YouTubeAlbumSplitter:
             if not line:
                 continue
             
+            # Skip lines that are likely headers or footers for tracklists
             if any(skip_word in line.lower() for skip_word in ['tracklist', 'track list', 'playlist', 'setlist']):
                 continue
+            
+            title = None
+            start_time = None
+
+            # Try Pattern 1 (Title before Timestamp) first
+            match = pattern_title_before_ts.match(line)
+            if match:
+                title = match.group(1).strip()
+                start_time = match.group(2)
+            else:
+                # If Pattern 1 doesn't match, try Pattern 2 (Timestamp before Title)
+                match = pattern_ts_before_title.match(line)
+                if match:
+                    start_time = match.group(1)
+                    title = match.group(2).strip()
+
+            if title and start_time:
+                # Apply general cleanup to the extracted title
+                # Remove any text within parentheses or square brackets (e.g., [Official Video], (Live))
+                title = re.sub(r'[\[\(].*?[\]\)]', '', title).strip() 
+                # Remove leading/trailing quotes (single, double, Japanese)
+                title = title.strip('「」『』""\'\'') 
+                # Remove any trailing tilde or similar symbols
+                title = title.rstrip('~〜')
+                # NEW: More comprehensive cleanup for leading noise (numbers, punctuation, spaces, etc.)
+                # This regex matches one or more occurrences of common leading junk characters
+                # including hyphens, spaces, periods, digits (half-width and full-width Japanese),
+                # and various bracket/quote characters at the beginning of the string.
+                title = re.sub(r'^[-\s\.\d０-９\[\]\(\)「」『』"\'~〜]+', '', title, flags=re.UNICODE).strip()
+
+                if not title or title.isdigit(): # Skip if title is empty or just numbers
+                    continue
                 
-            for pattern in patterns:
-                matches = re.findall(pattern, line, re.UNICODE)
-                for match in matches:
-                    if len(match) == 3:
-                        start_time, title, end_time = match
-                        title = title.strip()
-                    elif pattern.startswith(r'(\d'):
-                        timestamp, title = match[:2]
-                        if ' - ' in line or ' – ' in line:
-                            continue
-                        start_time = timestamp
-                        end_time = None
-                    else:
-                        title, timestamp = match[:2]
-                        start_time = timestamp
-                        end_time = None
+                try:
+                    self.parse_timestamp(start_time) # Validate timestamp
                     
-                    title = re.sub(r'^[\d\.\)\]\-–—\s]+', '', title).strip()
-                    title = re.sub(r'[\[\(].*?[\]\)]', '', title).strip()
-                    title = title.strip('「」『』""''')
-                    title = title.strip()
-                    
-                    if not title or title.isdigit():
-                        continue
-                    
-                    try:
-                        self.parse_timestamp(start_time)
-                        if end_time:
-                            self.parse_timestamp(end_time)
-                        
-                        if not any(t.title == title and t.start_time == start_time for t in tracks):
-                            tracks.append(Track(title, start_time, end_time))
-                        break
-                    except ValueError:
-                        continue
+                    # Check for duplicates before adding to avoid redundant tracks
+                    if not any(t.title == title and t.start_time == start_time for t in tracks):
+                        tracks.append(Track(title, start_time)) # End time will be set in post-processing
+                except ValueError:
+                    # If timestamp is invalid, skip this line
+                    continue
         
+        # Sort tracks by their start time to ensure correct ordering
         tracks.sort(key=lambda t: self.parse_timestamp(t.start_time))
         
+        # Assign end times based on the start time of the next track
         for i in range(len(tracks)):
-            if not tracks[i].end_time and i < len(tracks) - 1:
+            if i < len(tracks) - 1:
                 tracks[i].end_time = tracks[i + 1].start_time
+            # The last track's end_time remains None, which is handled by split_audio to go until the end of the audio.
         
         return tracks
     
@@ -486,10 +514,8 @@ class AudioPlayerControl(ttk.Frame):
         # Update volume icon based on level
         if volume == 0:
             self.volume_icon.config(text="🔇")
-        elif volume < 0.3:
-            self.volume_icon.config(text="🔈")
         elif volume < 0.6:
-            self.volume_icon.config(text="🔉")
+            self.volume_icon.config(text="🔈")
         else:
             self.volume_icon.config(text="🔊")
 
@@ -822,7 +848,7 @@ class ThumbnailCropper(tk.Toplevel):
 
             # Clamp movement to image boundaries
             width = self.initial_drag_crop_x2 - self.initial_drag_crop_x1
-            height = self.initial_drag_crop_y2 - self.initial_crop_y1 # Corrected: initial_drag_crop_y1 instead of initial_crop_y1
+            height = self.initial_drag_crop_y2 - self.initial_drag_crop_y1
 
             if new_x1 < img_x1:
                 new_x1 = img_x1
