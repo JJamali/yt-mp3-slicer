@@ -496,7 +496,7 @@ class YouTubeAlbumSplitterGUI:
         url_entry = ttk.Entry(url_frame, textvariable=self.url_var, width=60)
         url_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
         
-        self.download_btn = ttk.Button(url_frame, text="Download & Analyze", command=self.download_and_analyze)
+        self.download_btn = ttk.Button(url_frame, text="Download & Analyse", command=self.download_and_analyse)
         self.download_btn.grid(row=0, column=1)
         
         url_frame.columnconfigure(0, weight=1)
@@ -576,7 +576,7 @@ class YouTubeAlbumSplitterGUI:
         self.player_controls = AudioPlayerControl(main_frame, self.preview)
         self.player_controls.grid(row=6, column=0, columnspan=2, pady=(10, 0), sticky=(tk.W, tk.E))
     
-    def download_and_analyze(self):
+    def download_and_analyse(self):
         url = self.url_var.get().strip()
         if not url:
             messagebox.showerror("Error", "Please enter a YouTube URL")
