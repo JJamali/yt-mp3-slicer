@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-YouTube Album Splitter GUI
-A GUI tool to download YouTube videos and split them into individual MP3 tracks.
-"""
-
 import os
 import re
 import sys
@@ -17,9 +11,10 @@ import pygame
 import yt_dlp
 import requests
 from io import BytesIO
-from PIL import Image, ImageTk
-from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, APIC, TIT2, TALB, TPE1
+from PIL import Image, ImageTk, ImageDraw # Import ImageDraw
+from mutagen.mp3 import MP3 # pip install mutagen
+from mutagen.id3 import ID3, APIC, TIT2, TALB, TPE1 # pip install mutagen
+
 
 class Track:
     def __init__(self, title: str, start_time: str, end_time: str = None):
@@ -179,19 +174,19 @@ class YouTubeAlbumSplitter:
         except Exception as e:
             raise Exception(f"Failed to download audio: {e}")
         
-    def split_audio(self, tracks: List[Track], output_dir: str = "output", progress_callback=None):
+    def split_audio(self, tracks: List[Track], output_dir: str = "output", cropped_thumbnail_data: bytes = None, progress_callback=None):
         """Split audio file into individual tracks with thumbnails"""
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        # Download thumbnail once
-        thumbnail_data = None
-        if self.video_info and 'thumbnail' in self.video_info:
+        # Use the provided cropped_thumbnail_data or download original if not provided
+        final_thumbnail_data = cropped_thumbnail_data
+        if not final_thumbnail_data and self.video_info and 'thumbnail' in self.video_info:
             try:
                 response = requests.get(self.video_info['thumbnail'])
-                thumbnail_data = response.content
+                final_thumbnail_data = response.content
             except Exception as e:
-                print(f"Couldn't download thumbnail: {e}")
+                print(f"Couldn't download original thumbnail: {e}")
 
         for i, track in enumerate(tracks, 1):
             if progress_callback:
@@ -225,14 +220,14 @@ class YouTubeAlbumSplitter:
                 subprocess.run(cmd, check=True, capture_output=True)
                 
                 # Add metadata and thumbnail
-                if thumbnail_data:
-                    self.add_mp3_metadata(output_file, track.title, thumbnail_data)
+                if final_thumbnail_data:
+                    self.add_mp3_metadata(output_file, track.title, final_thumbnail_data)
                     
             except subprocess.CalledProcessError as e:
                 raise Exception(f"Failed to create {track.title}: {e.stderr.decode()}")
     
     def add_mp3_metadata(self, filepath: str, title: str, thumbnail_data: bytes):
-        """Add ID3 tags and thumbnail to MP3 file. Cause I like doing that."""
+        """Add ID3 tags and thumbnail to MP3 file with optional cropping"""
         try:
             audio = MP3(filepath, ID3=ID3)
             
@@ -245,10 +240,10 @@ class YouTubeAlbumSplitter:
             # Add thumbnail (album art)
             audio.tags.add(APIC(
                 encoding=3,  # UTF-8
-                mime='image/jpeg',
+                mime='image/jpeg', # Assuming JPEG for thumbnails
                 type=3,      # Cover image
                 desc='Cover',
-                data=thumbnail_data
+                data=thumbnail_data  # This will be the cropped version if user selected one
             ))
             
             # Add basic metadata
@@ -467,6 +462,365 @@ class AudioPlayerControl(ttk.Frame):
         self.seek_var.set(0)
         self.update_time_display()
 
+class ThumbnailCropper(tk.Toplevel):
+    def __init__(self, parent, image_data):
+        super().__init__(parent)
+        self.title("Crop Thumbnail")
+        self.parent = parent
+        self.image_data = image_data
+        
+        self.original_image = Image.open(BytesIO(image_data))
+        self.display_image = None # Will store the scaled image for display
+        self.photo_image = None # Tkinter PhotoImage reference
+
+        # Canvas and image scaling properties
+        self.canvas_width = 600
+        self.canvas_height = 600
+        self.scale_factor_x = 1
+        self.scale_factor_y = 1
+        self.image_offset_x = 0
+        self.image_offset_y = 0
+
+        # Crop rectangle coordinates (on canvas)
+        self.crop_x1 = 0
+        self.crop_y1 = 0
+        self.crop_x2 = 0
+        self.crop_y2 = 0
+        self.rect_id = None
+        self.handle_ids = []
+        self.HANDLE_SIZE = 8 # Size of square handles
+
+        # State variables for dragging/resizing
+        self.dragging_mode = None # 'move' or 'resize_corner_NE', 'resize_corner_NW', etc.
+        self.drag_start_x = None
+        self.drag_start_y = None
+        
+        self.canvas = tk.Canvas(self, width=self.canvas_width, height=self.canvas_height, bg="grey")
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.canvas.bind("<ButtonPress-1>", self.on_button_press)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_button_release)
+        self.canvas.bind("<Motion>", self.on_mouse_move) # For cursor changes
+        self.canvas.bind("<Configure>", self.on_canvas_resize) # Handle window resize
+
+        # Buttons
+        button_frame = ttk.Frame(self)
+        button_frame.pack(pady=10)
+        
+        ttk.Button(button_frame, text="Crop", command=self.perform_crop).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Cancel", command=self.cancel_crop).pack(side=tk.LEFT, padx=5)
+
+        # Initial drawing after canvas is packed and has dimensions
+        self.update_canvas_image()
+        self.draw_initial_crop_rectangle()
+        
+        self.protocol("WM_DELETE_WINDOW", self.cancel_crop)
+        self.transient(parent) # Make it modal
+        self.grab_set() # Grab all events for this window
+        self.parent.wait_window(self) # Wait until this window is closed
+
+    def on_canvas_resize(self, event):
+        # Update canvas dimensions when window is resized
+        self.canvas_width = event.width
+        self.canvas_height = event.height
+        self.update_canvas_image()
+        self.draw_crop_rectangle() # Redraw the existing crop rectangle and handles
+
+    def update_canvas_image(self):
+        self.canvas.delete("all")
+        
+        img_width, img_height = self.original_image.size
+        
+        # Calculate scale to fit image within canvas while maintaining aspect ratio
+        scale = min(self.canvas_width / img_width, self.canvas_height / img_height)
+        new_width = int(img_width * scale)
+        new_height = int(img_height * scale)
+        
+        self.display_image = self.original_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        self.photo_image = ImageTk.PhotoImage(self.display_image)
+        
+        # Store scale factor for converting canvas coordinates to original image coordinates
+        self.scale_factor_x = img_width / new_width
+        self.scale_factor_y = img_height / new_height
+
+        # Store image offset on canvas
+        self.image_offset_x = (self.canvas_width - new_width) / 2
+        self.image_offset_y = (self.canvas_height - new_height) / 2
+        
+        self.canvas.create_image(self.image_offset_x, self.image_offset_y, image=self.photo_image, anchor=tk.NW)
+        
+        # Redraw the rectangle and handles (if they exist)
+        if self.rect_id:
+            self.draw_crop_rectangle()
+
+    def draw_initial_crop_rectangle(self):
+        # Ensure display_image is ready
+        if not self.display_image:
+            self.update_canvas_image()
+
+        img_width, img_height = self.display_image.size
+        
+        # Determine the size of the largest possible square on the displayed image
+        square_side = min(img_width, img_height)
+        
+        # Calculate top-left corner for centering within the displayed image
+        self.crop_x1 = (img_width - square_side) / 2 + self.image_offset_x
+        self.crop_y1 = (img_height - square_side) / 2 + self.image_offset_y
+        
+        self.crop_x2 = self.crop_x1 + square_side
+        self.crop_y2 = self.crop_y1 + square_side
+        
+        self.draw_crop_rectangle()
+
+    def draw_crop_rectangle(self):
+        # Clear previous rectangle and handles
+        if self.rect_id:
+            self.canvas.delete(self.rect_id)
+        for handle_id in self.handle_ids:
+            self.canvas.delete(handle_id)
+        self.handle_ids.clear()
+
+        # Ensure x1<x2, y1<y2 for drawing
+        x1, y1 = min(self.crop_x1, self.crop_x2), min(self.crop_y1, self.crop_y2)
+        x2, y2 = max(self.crop_x1, self.crop_x2), max(self.crop_y1, self.crop_y2)
+
+        self.rect_id = self.canvas.create_rectangle(
+            x1, y1, x2, y2, outline="red", width=2, tags="crop_box"
+        )
+        
+        # Draw handles
+        self.handle_ids.append(self.canvas.create_rectangle(x1 - self.HANDLE_SIZE/2, y1 - self.HANDLE_SIZE/2, x1 + self.HANDLE_SIZE/2, y1 + self.HANDLE_SIZE/2, fill="blue", tags="handle_NW"))
+        self.handle_ids.append(self.canvas.create_rectangle(x2 - self.HANDLE_SIZE/2, y1 - self.HANDLE_SIZE/2, x2 + self.HANDLE_SIZE/2, y1 + self.HANDLE_SIZE/2, fill="blue", tags="handle_NE"))
+        self.handle_ids.append(self.canvas.create_rectangle(x1 - self.HANDLE_SIZE/2, y2 - self.HANDLE_SIZE/2, x1 + self.HANDLE_SIZE/2, y2 + self.HANDLE_SIZE/2, fill="blue", tags="handle_SW"))
+        self.handle_ids.append(self.canvas.create_rectangle(x2 - self.HANDLE_SIZE/2, y2 - self.HANDLE_SIZE/2, x2 + self.HANDLE_SIZE/2, y2 + self.HANDLE_SIZE/2, fill="blue", tags="handle_SE"))
+
+    def get_handle_type(self, x, y):
+        x1, y1 = min(self.crop_x1, self.crop_y1), min(self.crop_x1, self.crop_y2) # Corrected logic
+        x2, y2 = max(self.crop_x1, self.crop_x2), max(self.crop_y1, self.crop_y2)
+
+        # Re-calculate correct x1, y1, x2, y2 based on self.crop_x1/y1/x2/y2 being potentially unordered
+        current_x1, current_y1 = min(self.crop_x1, self.crop_x2), min(self.crop_y1, self.crop_y2)
+        current_x2, current_y2 = max(self.crop_x1, self.crop_x2), max(self.crop_y1, self.crop_y2)
+
+        handle_tolerance = self.HANDLE_SIZE 
+        
+        if (current_x1 - handle_tolerance <= x <= current_x1 + handle_tolerance) and \
+           (current_y1 - handle_tolerance <= y <= current_y1 + handle_tolerance):
+            return 'resize_corner_NW'
+        elif (current_x2 - handle_tolerance <= x <= current_x2 + handle_tolerance) and \
+             (current_y1 - handle_tolerance <= y <= current_y1 + handle_tolerance):
+            return 'resize_corner_NE'
+        elif (current_x1 - handle_tolerance <= x <= current_x1 + handle_tolerance) and \
+             (current_y2 - handle_tolerance <= y <= current_y2 + handle_tolerance):
+            return 'resize_corner_SW'
+        elif (current_x2 - handle_tolerance <= x <= current_x2 + handle_tolerance) and \
+             (current_y2 - handle_tolerance <= y <= current_y2 + handle_tolerance):
+            return 'resize_corner_SE'
+        elif (current_x1 <= x <= current_x2) and (current_y1 <= y <= current_y2):
+            return 'move' # Inside the crop box
+        return None
+
+    def on_mouse_move(self, event):
+        mode = self.get_handle_type(event.x, event.y)
+        if mode == 'move':
+            self.canvas.config(cursor="fleur")
+        elif mode and 'resize' in mode:
+            # Change cursor based on corner for diagonal resize
+            if mode in ['resize_corner_NW', 'resize_corner_SE']:
+                self.canvas.config(cursor="sizing NW_SE")
+            elif mode in ['resize_corner_NE', 'resize_corner_SW']:
+                self.canvas.config(cursor="sizing NE_SW")
+        else:
+            self.canvas.config(cursor="arrow") # Default cursor
+
+    def on_button_press(self, event):
+        self.drag_start_x = event.x
+        self.drag_start_y = event.y
+        self.dragging_mode = self.get_handle_type(event.x, event.y)
+
+        # Store current crop coordinates for calculations
+        self.initial_crop_x1 = self.crop_x1
+        self.initial_crop_y1 = self.crop_y1
+        self.initial_crop_x2 = self.crop_x2
+        self.initial_crop_y2 = self.crop_y2
+
+    def on_mouse_drag(self, event):
+        dx = event.x - self.drag_start_x
+        dy = event.y - self.drag_start_y
+
+        # Define image boundaries on canvas
+        img_x1 = self.image_offset_x
+        img_y1 = self.image_offset_y
+        img_x2 = self.image_offset_x + self.display_image.width
+        img_y2 = self.image_offset_y + self.display_image.height
+
+        # Ensure current crop coordinates are ordered for calculations
+        current_x1_ordered, current_y1_ordered = min(self.initial_crop_x1, self.initial_crop_x2), min(self.initial_crop_y1, self.initial_crop_y2)
+        current_x2_ordered, current_y2_ordered = max(self.initial_crop_x1, self.initial_crop_x2), max(self.initial_crop_y1, self.initial_crop_y2)
+        
+        current_width = current_x2_ordered - current_x1_ordered
+        current_height = current_y2_ordered - current_y1_ordered
+        current_side = current_width # Since it's a square, width and height are the same
+
+        if self.dragging_mode == 'move':
+            new_x1 = self.initial_crop_x1 + dx
+            new_y1 = self.initial_crop_y1 + dy
+            new_x2 = self.initial_crop_x2 + dx
+            new_y2 = self.initial_crop_y2 + dy
+
+            # Clamp movement to image boundaries
+            width = self.initial_crop_x2 - self.initial_crop_x1
+            height = self.initial_crop_y2 - self.initial_crop_y1 # Should be same as width
+
+            if new_x1 < img_x1:
+                new_x1 = img_x1
+                new_x2 = new_x1 + width
+            elif new_x2 > img_x2:
+                new_x2 = img_x2
+                new_x1 = new_x2 - width
+
+            if new_y1 < img_y1:
+                new_y1 = img_y1
+                new_y2 = new_y1 + height
+            elif new_y2 > img_y2:
+                new_y2 = img_y2
+                new_y1 = new_y2 - height
+
+            self.crop_x1, self.crop_y1, self.crop_x2, self.crop_y2 = new_x1, new_y1, new_x2, new_y2
+            self.draw_crop_rectangle()
+
+        elif 'resize' in self.dragging_mode:
+            min_size = 10 # Minimum side length for the crop box
+
+            if self.dragging_mode == 'resize_corner_NW':
+                new_x1 = current_x1_ordered + dx
+                new_y1 = current_y1_ordered + dy
+
+                # Ensure we don't go past the opposite corner (SE)
+                new_x1 = min(new_x1, current_x2_ordered - min_size)
+                new_y1 = min(new_y1, current_y2_ordered - min_size)
+
+                # Clamp to image boundaries
+                new_x1 = max(new_x1, img_x1)
+                new_y1 = max(new_y1, img_y1)
+
+                # Calculate new side based on clamped new_x1, new_y1
+                candidate_side_x = current_x2_ordered - new_x1
+                candidate_side_y = current_y2_ordered - new_y1
+                
+                final_side = min(candidate_side_x, candidate_side_y)
+                final_side = max(min_size, final_side) # Ensure min size
+
+                self.crop_x1 = current_x2_ordered - final_side
+                self.crop_y1 = current_y2_ordered - final_side
+                self.crop_x2 = current_x2_ordered
+                self.crop_y2 = current_y2_ordered
+                
+            elif self.dragging_mode == 'resize_corner_NE':
+                new_x2 = current_x2_ordered + dx
+                new_y1 = current_y1_ordered + dy
+
+                new_x2 = max(new_x2, current_x1_ordered + min_size)
+                new_y1 = min(new_y1, current_y2_ordered - min_size)
+
+                new_x2 = min(new_x2, img_x2)
+                new_y1 = max(new_y1, img_y1)
+                
+                candidate_side_x = new_x2 - current_x1_ordered
+                candidate_side_y = current_y2_ordered - new_y1
+
+                final_side = min(candidate_side_x, candidate_side_y)
+                final_side = max(min_size, final_side)
+
+                self.crop_x1 = current_x1_ordered
+                self.crop_y1 = current_y2_ordered - final_side
+                self.crop_x2 = current_x1_ordered + final_side
+                self.crop_y2 = current_y2_ordered
+
+            elif self.dragging_mode == 'resize_corner_SW':
+                new_x1 = current_x1_ordered + dx
+                new_y2 = current_y2_ordered + dy
+
+                new_x1 = min(new_x1, current_x2_ordered - min_size)
+                new_y2 = max(new_y2, current_y1_ordered + min_size)
+
+                new_x1 = max(new_x1, img_x1)
+                new_y2 = min(new_y2, img_y2)
+
+                candidate_side_x = current_x2_ordered - new_x1
+                candidate_side_y = new_y2 - current_y1_ordered
+
+                final_side = min(candidate_side_x, candidate_side_y)
+                final_side = max(min_size, final_side)
+
+                self.crop_x1 = current_x2_ordered - final_side
+                self.crop_y1 = current_y1_ordered
+                self.crop_x2 = current_x2_ordered
+                self.crop_y2 = current_y1_ordered + final_side
+
+            elif self.dragging_mode == 'resize_corner_SE':
+                new_x2 = current_x2_ordered + dx
+                new_y2 = current_y2_ordered + dy
+
+                new_x2 = max(new_x2, current_x1_ordered + min_size)
+                new_y2 = max(new_y2, current_y1_ordered + min_size)
+
+                new_x2 = min(new_x2, img_x2)
+                new_y2 = min(new_y2, img_y2)
+                
+                candidate_side_x = new_x2 - current_x1_ordered
+                candidate_side_y = new_y2 - current_y1_ordered
+
+                final_side = min(candidate_side_x, candidate_side_y)
+                final_side = max(min_size, final_side)
+
+                self.crop_x1 = current_x1_ordered
+                self.crop_y1 = current_y1_ordered
+                self.crop_x2 = current_x1_ordered + final_side
+                self.crop_y2 = current_y1_ordered + final_side
+
+            self.draw_crop_rectangle()
+
+    def on_button_release(self, event):
+        self.dragging_mode = None
+        self.drag_start_x = None
+        self.drag_start_y = None
+        self.canvas.config(cursor="arrow") # Reset cursor
+
+    def perform_crop(self):
+        # Get the current coordinates of the rectangle object
+        x1_canvas, y1_canvas, x2_canvas, y2_canvas = self.canvas.coords(self.rect_id)
+
+        # Reorder coordinates to ensure x1 < x2 and y1 < y2
+        x1_canvas, x2_canvas = min(x1_canvas, x2_canvas), max(x1_canvas, x2_canvas)
+        y1_canvas, y2_canvas = min(y1_canvas, y2_canvas), max(y1_canvas, y2_canvas)
+
+        # Adjust for image offset on canvas
+        crop_original_x1 = int((x1_canvas - self.image_offset_x) * self.scale_factor_x)
+        crop_original_y1 = int((y1_canvas - self.image_offset_y) * self.scale_factor_y)
+        crop_original_x2 = int((x2_canvas - self.image_offset_x) * self.scale_factor_x)
+        crop_original_y2 = int((y2_canvas - self.image_offset_y) * self.scale_factor_y)
+
+        # Ensure coordinates are within original image bounds (should already be due to clamping)
+        crop_original_x1 = max(0, crop_original_x1)
+        crop_original_y1 = max(0, crop_original_y1)
+        crop_original_x2 = min(self.original_image.width, crop_original_x2)
+        crop_original_y2 = min(self.original_image.height, crop_original_y2)
+
+        cropped_image = self.original_image.crop((crop_original_x1, crop_original_y1, crop_original_x2, crop_original_y2))
+        
+        # Convert to bytes
+        byte_arr = BytesIO()
+        cropped_image.save(byte_arr, format='JPEG') # Assuming JPEG for thumbnails
+        self.cropped_image_data = byte_arr.getvalue()
+        
+        self.destroy()
+
+    def cancel_crop(self):
+        self.cropped_image_data = None
+        self.destroy()
+
 class YouTubeAlbumSplitterGUI:
     def __init__(self, root):
         self.root = root
@@ -481,6 +835,8 @@ class YouTubeAlbumSplitterGUI:
         pygame.mixer.init()
         
         self.thumbnail_label = None
+        self.thumbnail_data = None # Store the initially fetched thumbnail data
+        self.cropped_thumbnail_data = None # Store the final (potentially cropped) thumbnail data
         self.setup_ui()
 
     def setup_ui(self):
@@ -509,15 +865,20 @@ class YouTubeAlbumSplitterGUI:
         status_label = ttk.Label(main_frame, textvariable=self.status_var)
         status_label.grid(row=2, column=0, columnspan=2, pady=(0, 10))
 
-        # Thumbnail display
-        thumbnail_frame = ttk.Frame(main_frame)
-        thumbnail_frame.grid(row=1, column=0, columnspan=2, pady=(0, 10))
-        self.thumbnail_label = ttk.Label(thumbnail_frame)
-        self.thumbnail_label.pack()
+        # Thumbnail display area
+        thumbnail_display_frame = ttk.LabelFrame(main_frame, text="Current Thumbnail", padding="5")
+        thumbnail_display_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         
-        # Tracks frame
+        self.thumbnail_label = ttk.Label(thumbnail_display_frame)
+        self.thumbnail_label.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        # Button to re-crop/change thumbnail
+        ttk.Button(thumbnail_display_frame, text="Change/Crop Thumbnail", command=self.change_crop_thumbnail).pack(side=tk.LEFT, padx=10)
+
+
+        # Tracks frame (now row 4)
         tracks_frame = ttk.LabelFrame(main_frame, text="Tracks", padding="5")
-        tracks_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        tracks_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         
         # Treeview for tracks
         columns = ('Title', 'Start', 'End', 'Duration')
@@ -552,9 +913,9 @@ class YouTubeAlbumSplitterGUI:
         self.stop_preview_btn = ttk.Button(buttons_frame, text="Stop Preview", command=self.stop_preview)
         self.stop_preview_btn.grid(row=0, column=4, padx=5)
         
-        # Output frame
+        # Output frame (now row 5)
         output_frame = ttk.LabelFrame(main_frame, text="Output", padding="5")
-        output_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        output_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         
         self.output_var = tk.StringVar(value="output")
         ttk.Label(output_frame, text="Output Directory:").grid(row=0, column=0, sticky=tk.W)
@@ -563,18 +924,18 @@ class YouTubeAlbumSplitterGUI:
         
         output_frame.columnconfigure(1, weight=1)
         
-        # Process button
+        # Process button (now row 6)
         self.process_btn = ttk.Button(main_frame, text="Split Audio", command=self.split_audio, state='disabled')
-        self.process_btn.grid(row=5, column=0, columnspan=2, pady=10)
+        self.process_btn.grid(row=6, column=0, columnspan=2, pady=10)
         
         # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(3, weight=1)
+        main_frame.rowconfigure(4, weight=1) # Tracks frame is row 4
 
         self.player_controls = AudioPlayerControl(main_frame, self.preview)
-        self.player_controls.grid(row=6, column=0, columnspan=2, pady=(10, 0), sticky=(tk.W, tk.E))
+        self.player_controls.grid(row=7, column=0, columnspan=2, pady=(10, 0), sticky=(tk.W, tk.E))
     
     def download_and_analyse(self):
         url = self.url_var.get().strip()
@@ -582,6 +943,12 @@ class YouTubeAlbumSplitterGUI:
             messagebox.showerror("Error", "Please enter a YouTube URL")
             return
         
+        # Clear previous thumbnail if any
+        self.thumbnail_data = None
+        self.cropped_thumbnail_data = None
+        self.thumbnail_label.config(image='')
+        self.thumbnail_label.image = None
+
         def download_thread():
             try:
                 self.root.after(0, lambda: self.progress.start())
@@ -602,7 +969,7 @@ class YouTubeAlbumSplitterGUI:
                 self.root.after(0, lambda: self.download_btn.config(state='normal'))
                 self.root.after(0, lambda: self.process_btn.config(state='normal'))
                 update_status(f"Found {len(auto_tracks)} tracks")
-                self.root.after(0, self.fetch_thumbnail)
+                self.root.after(0, self.fetch_thumbnail) # Call to fetch thumbnail
 
             except Exception as e:
                 self.root.after(0, lambda: self.progress.stop())
@@ -739,25 +1106,93 @@ class YouTubeAlbumSplitterGUI:
             if not thumbnail_url:
                 return
 
-            # Download and resize thumbnail
+            # Download thumbnail
             response = requests.get(thumbnail_url, stream=True)
             response.raise_for_status()
+            self.thumbnail_data = response.content # Store the original downloaded thumbnail
+            self.cropped_thumbnail_data = self.thumbnail_data # Initially, cropped is same as original
             
-            img_data = response.content
-            img = Image.open(BytesIO(img_data))
-            
-            # Resize to fit GUI (adjust dimensions as needed)
-            img.thumbnail((320, 180))
-            
-            # Convert for Tkinter
-            photo = ImageTk.PhotoImage(img)
-            
-            # Update label
-            self.thumbnail_label.config(image=photo)
-            self.thumbnail_label.image = photo  # Keep reference
+            # Show thumbnail and ask if user wants to crop
+            self.show_thumbnail_with_crop_option()
             
         except Exception as e:
             print(f"Error loading thumbnail: {e}")
+            messagebox.showwarning("Thumbnail Error", f"Could not fetch thumbnail: {e}")
+    
+    def show_thumbnail_with_crop_option(self):
+        """Display thumbnail and let user choose to crop"""
+        # Create a dialog with the thumbnail
+        crop_dialog = tk.Toplevel(self.root)
+        crop_dialog.title("Thumbnail Options")
+        
+        # Display thumbnail
+        img = Image.open(BytesIO(self.thumbnail_data))
+        img.thumbnail((200, 200)) # Smaller for this dialog
+        photo = ImageTk.PhotoImage(img)
+        
+        label = ttk.Label(crop_dialog, image=photo)
+        label.image = photo  # Keep reference
+        label.pack(pady=10)
+        
+        # Ask user if they want to crop
+        ttk.Label(crop_dialog, text="Would you like to crop this thumbnail?").pack()
+        
+        button_frame = ttk.Frame(crop_dialog)
+        button_frame.pack(pady=10)
+        
+        ttk.Button(button_frame, text="Crop", command=lambda: self.start_cropping(crop_dialog)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Use As Is", command=lambda: self.use_thumbnail_as_is(crop_dialog)).pack(side=tk.LEFT, padx=5)
+        
+        crop_dialog.transient(self.root)
+        crop_dialog.grab_set()
+        self.root.wait_window(crop_dialog) # Make sure this dialog blocks until closed
+
+    def start_cropping(self, dialog):
+        dialog.destroy()
+        cropper = ThumbnailCropper(self.root, self.thumbnail_data)
+        self.root.wait_window(cropper) # Wait for cropper window to close
+        
+        if hasattr(cropper, 'cropped_image_data') and cropper.cropped_image_data is not None:
+            self.cropped_thumbnail_data = cropper.cropped_image_data
+            self.display_final_thumbnail()
+        else:
+            # If cropping was canceled, revert to the original uncropped image data
+            self.cropped_thumbnail_data = self.thumbnail_data
+            self.display_final_thumbnail()
+    
+    def use_thumbnail_as_is(self, dialog):
+        dialog.destroy()
+        self.cropped_thumbnail_data = self.thumbnail_data # Confirm using original
+        self.display_final_thumbnail()
+    
+    def display_final_thumbnail(self):
+        """Display the final (cropped or original) thumbnail on the main UI."""
+        if self.cropped_thumbnail_data:
+            try:
+                img = Image.open(BytesIO(self.cropped_thumbnail_data))
+                img.thumbnail((150, 150))  # Display size on main UI
+                
+                # Make sure it's square for consistent display if not already from cropping
+                if img.width != img.height:
+                    size = min(img.width, img.height)
+                    left = (img.width - size) / 2
+                    top = (img.height - size) / 2
+                    right = (img.width + size) / 2
+                    bottom = (img.height + size) / 2
+                    img = img.crop((left, top, right, bottom))
+                
+                photo = ImageTk.PhotoImage(img)
+                
+                self.thumbnail_label.config(image=photo)
+                self.thumbnail_label.image = photo  # Keep reference
+                
+            except Exception as e:
+                print(f"Error displaying final thumbnail: {e}")
+                self.thumbnail_label.config(image='')
+                self.thumbnail_label.image = None
+        else:
+            self.thumbnail_label.config(image='')
+            self.thumbnail_label.image = None
 
 
     def stop_preview(self):
@@ -769,121 +1204,135 @@ class YouTubeAlbumSplitterGUI:
         directory = filedialog.askdirectory()
         if directory:
             self.output_var.set(directory)
-    
+
     def split_audio(self):
         if not self.tracks:
-            messagebox.showwarning("Warning", "No tracks to process")
+            messagebox.showwarning("Warning", "No tracks to split.")
             return
         
-        output_dir = self.output_var.get()
+        if not self.splitter.audio_file:
+            messagebox.showerror("Error", "No audio file downloaded.")
+            return
+
+        output_dir = self.output_var.get().strip()
         if not output_dir:
-            messagebox.showerror("Error", "Please specify output directory")
+            messagebox.showerror("Error", "Please select an output directory.")
             return
         
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
         def split_thread():
             try:
                 self.root.after(0, lambda: self.progress.start())
                 self.root.after(0, lambda: self.process_btn.config(state='disabled'))
+                self.root.after(0, lambda: self.download_btn.config(state='disabled'))
                 
                 def update_status(status):
                     self.root.after(0, lambda: self.status_var.set(status))
                 
-                self.splitter.split_audio(self.tracks, output_dir, update_status)
+                # Pass the cropped_thumbnail_data to the splitter
+                self.splitter.split_audio(self.tracks, output_dir, self.cropped_thumbnail_data, update_status)
                 
                 self.root.after(0, lambda: self.progress.stop())
                 self.root.after(0, lambda: self.process_btn.config(state='normal'))
-                self.root.after(0, lambda: messagebox.showinfo("Success", f"Created {len(self.tracks)} tracks in {output_dir}"))
-                update_status("Completed")
-                
+                self.root.after(0, lambda: self.download_btn.config(state='normal'))
+                self.root.after(0, lambda: self.status_var.set(f"Successfully split {len(self.tracks)} tracks."))
+                messagebox.showinfo("Success", f"Successfully split {len(self.tracks)} tracks to {output_dir}")
+
             except Exception as e:
                 self.root.after(0, lambda: self.progress.stop())
                 self.root.after(0, lambda: self.process_btn.config(state='normal'))
-                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
-                self.root.after(0, lambda: self.status_var.set("Error"))
+                self.root.after(0, lambda: self.download_btn.config(state='normal'))
+                self.root.after(0, lambda: messagebox.showerror("Error", f"Splitting failed: {e}"))
+                self.root.after(0, lambda: self.status_var.set("Splitting failed"))
+            finally:
+                self.splitter.cleanup()
         
         threading.Thread(target=split_thread, daemon=True).start()
 
-class TrackDialog:
-    def __init__(self, parent, title, track_title="", start_time="0:00", end_time=""):
+    def change_crop_thumbnail(self):
+        """Allows user to re-crop or re-select the thumbnail."""
+        if not self.thumbnail_data:
+            messagebox.showwarning("No Thumbnail", "Please download a video first to get a thumbnail.")
+            return
+        
+        # We start the cropping process with the original downloaded thumbnail data
+        cropper = ThumbnailCropper(self.root, self.thumbnail_data)
+        self.root.wait_window(cropper) 
+        
+        if hasattr(cropper, 'cropped_image_data') and cropper.cropped_image_data is not None:
+            self.cropped_thumbnail_data = cropper.cropped_image_data
+            self.display_final_thumbnail()
+        else:
+            # If cropping was canceled, simply ensure the last valid thumbnail is displayed
+            self.display_final_thumbnail()
+
+
+    def on_closing(self):
+        if messagebox.askokcancel("Quit", "Do you want to quit?"):
+            self.preview.stop_preview()
+            self.splitter.cleanup()
+            self.root.destroy()
+
+class TrackDialog(tk.Toplevel):
+    def __init__(self, parent, title, initial_title="", initial_start="", initial_end=""):
+        super().__init__(parent)
+        self.title(title)
+        self.transient(parent)
+        self.grab_set()
         self.result = None
         
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title(title)
-        self.dialog.geometry("400x200")
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
+        self.initial_title = initial_title
+        self.initial_start = initial_start
+        self.initial_end = initial_end
         
-        # Center the dialog
-        self.dialog.update_idletasks()
-        x = (self.dialog.winfo_screenwidth() // 2) - (400 // 2)
-        y = (self.dialog.winfo_screenheight() // 2) - (200 // 2)
-        self.dialog.geometry(f"400x200+{x}+{y}")
+        self.setup_ui()
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.parent.wait_window(self)
         
-        frame = ttk.Frame(self.dialog, padding="20")
-        frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+    def setup_ui(self):
+        form_frame = ttk.Frame(self, padding="10")
+        form_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Title
-        ttk.Label(frame, text="Title:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.title_var = tk.StringVar(value=track_title)
-        ttk.Entry(frame, textvariable=self.title_var, width=40).grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5)
+        ttk.Label(form_frame, text="Title:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.title_var = tk.StringVar(value=self.initial_title)
+        ttk.Entry(form_frame, textvariable=self.title_var, width=40).grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5)
         
-        # Start time
-        ttk.Label(frame, text="Start Time:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.start_var = tk.StringVar(value=start_time)
-        ttk.Entry(frame, textvariable=self.start_var, width=40).grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5)
+        ttk.Label(form_frame, text="Start Time (mm:ss or hh:mm:ss):").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.start_var = tk.StringVar(value=self.initial_start)
+        ttk.Entry(form_frame, textvariable=self.start_var, width=20).grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5)
         
-        # End time
-        ttk.Label(frame, text="End Time:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.end_var = tk.StringVar(value=end_time)
-        ttk.Entry(frame, textvariable=self.end_var, width=40).grid(row=2, column=1, sticky=(tk.W, tk.E), pady=5)
+        ttk.Label(form_frame, text="End Time (optional):").grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.end_var = tk.StringVar(value=self.initial_end)
+        ttk.Entry(form_frame, textvariable=self.end_var, width=20).grid(row=2, column=1, sticky=(tk.W, tk.E), pady=5)
         
-        # Buttons
-        button_frame = ttk.Frame(frame)
-        button_frame.grid(row=3, column=0, columnspan=2, pady=20)
+        button_frame = ttk.Frame(self, padding="10")
+        button_frame.pack(fill=tk.X)
         
-        ttk.Button(button_frame, text="OK", command=self.ok_clicked).grid(row=0, column=0, padx=5)
-        ttk.Button(button_frame, text="Cancel", command=self.cancel_clicked).grid(row=0, column=1, padx=5)
+        ttk.Button(button_frame, text="OK", command=self.ok).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Cancel", command=self.cancel).pack(side=tk.LEFT, padx=5)
         
-        frame.columnconfigure(1, weight=1)
-        
-        self.dialog.protocol("WM_DELETE_WINDOW", self.cancel_clicked)
-        self.dialog.wait_window()
-    
-    def ok_clicked(self):
+        form_frame.columnconfigure(1, weight=1)
+
+    def ok(self):
         title = self.title_var.get().strip()
         start_time = self.start_var.get().strip()
         end_time = self.end_var.get().strip()
         
         if not title or not start_time:
-            messagebox.showerror("Error", "Title and start time are required")
+            messagebox.showwarning("Input Error", "Title and Start Time are required.")
             return
         
         self.result = (title, start_time, end_time if end_time else None)
-        self.dialog.destroy()
-    
-    def cancel_clicked(self):
-        self.dialog.destroy()
+        self.destroy()
 
-def main():
-    # Check dependencies
-    try:
-        import yt_dlp
-        import pygame
-    except ImportError as e:
-        print(f"Missing dependency: {e}")
-        print("Install with: pip install requirements.txt")
-        sys.exit(1)
-    
-    # Check for ffmpeg
-    try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("ffmpeg is required. Please install ffmpeg and make sure it's in your PATH")
-        sys.exit(1)
-    
-    root = tk.Tk()
-    app = YouTubeAlbumSplitterGUI(root)
-    root.mainloop()
+    def cancel(self):
+        self.result = None
+        self.destroy()
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = YouTubeAlbumSplitterGUI(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    root.mainloop()
