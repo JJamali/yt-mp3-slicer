@@ -1,19 +1,18 @@
 import os
 import re
-import sys
 import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from typing import List
+from typing import List, Tuple, Optional
 import threading
 import tempfile
 import pygame
 import yt_dlp
 import requests
 from io import BytesIO
-from PIL import Image, ImageTk, ImageDraw # Import ImageDraw
-from mutagen.mp3 import MP3 # pip install mutagen
-from mutagen.id3 import ID3, APIC, TIT2, TALB, TPE1 # pip install mutagen
+from PIL import Image, ImageTk
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, APIC, TIT2, TALB, TPE1
 
 
 class Track:
@@ -27,10 +26,11 @@ class Track:
         return f"{self.title}: {self.start_time}{end}"
 
 class YouTubeAlbumSplitter:
-    def __init__(self):
+    def __init__(self, root_gui): # Pass root_gui to access its attributes
         self.video_info = None
         self.audio_file = None
         self.tracks = []
+        self.root_gui = root_gui # Store reference to the GUI instance
     
     def parse_timestamp(self, timestamp: str) -> int:
         """Convert timestamp string to seconds"""
@@ -463,11 +463,19 @@ class AudioPlayerControl(ttk.Frame):
         self.update_time_display()
 
 class ThumbnailCropper(tk.Toplevel):
-    def __init__(self, parent, image_data):
+    def __init__(self, parent, image_data: bytes, initial_crop_coords: Optional[Tuple[int, int, int, int]] = None):
+        """
+        :param parent: The parent Tkinter window.
+        :param image_data: The byte data of the original image to crop.
+        :param initial_crop_coords: Optional. A tuple (x1, y1, x2, y2) representing the
+                                    initial crop rectangle in the ORIGINAL IMAGE's coordinate system.
+                                    If None, the largest possible square centered on the displayed image will be used.
+        """
         super().__init__(parent)
         self.title("Crop Thumbnail")
         self.parent = parent
         self.image_data = image_data
+        self.initial_crop_coords_original = initial_crop_coords # Store original coords
         
         self.original_image = Image.open(BytesIO(image_data))
         self.display_image = None # Will store the scaled image for display
@@ -476,12 +484,12 @@ class ThumbnailCropper(tk.Toplevel):
         # Canvas and image scaling properties
         self.canvas_width = 600
         self.canvas_height = 600
-        self.scale_factor_x = 1
-        self.scale_factor_y = 1
-        self.image_offset_x = 0
-        self.image_offset_y = 0
+        self.scale_factor_x = 1 # Ratio of original_width / displayed_width
+        self.scale_factor_y = 1 # Ratio of original_height / displayed_height
+        self.image_offset_x = 0 # X offset of displayed image from canvas left edge
+        self.image_offset_y = 0 # Y offset of displayed image from canvas top edge
 
-        # Crop rectangle coordinates (on canvas)
+        # Crop rectangle coordinates (on canvas) - these are updated during dragging/resizing
         self.crop_x1 = 0
         self.crop_y1 = 0
         self.crop_x2 = 0
@@ -494,6 +502,12 @@ class ThumbnailCropper(tk.Toplevel):
         self.dragging_mode = None # 'move' or 'resize_corner_NE', 'resize_corner_NW', etc.
         self.drag_start_x = None
         self.drag_start_y = None
+        
+        # Store current crop coordinates for calculations during drag
+        self.initial_drag_crop_x1 = 0
+        self.initial_drag_crop_y1 = 0
+        self.initial_drag_crop_x2 = 0
+        self.initial_drag_crop_y2 = 0
         
         self.canvas = tk.Canvas(self, width=self.canvas_width, height=self.canvas_height, bg="grey")
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -512,8 +526,8 @@ class ThumbnailCropper(tk.Toplevel):
         ttk.Button(button_frame, text="Cancel", command=self.cancel_crop).pack(side=tk.LEFT, padx=5)
 
         # Initial drawing after canvas is packed and has dimensions
+        # This will call draw_initial_crop_rectangle via on_canvas_resize
         self.update_canvas_image()
-        self.draw_initial_crop_rectangle()
         
         self.protocol("WM_DELETE_WINDOW", self.cancel_crop)
         self.transient(parent) # Make it modal
@@ -525,7 +539,8 @@ class ThumbnailCropper(tk.Toplevel):
         self.canvas_width = event.width
         self.canvas_height = event.height
         self.update_canvas_image()
-        self.draw_crop_rectangle() # Redraw the existing crop rectangle and handles
+        # Ensure the crop rectangle is redrawn to fit new scaling/offsets
+        self.draw_initial_crop_rectangle(use_current_if_exists=True) # Use existing if already set
 
     def update_canvas_image(self):
         self.canvas.delete("all")
@@ -550,28 +565,79 @@ class ThumbnailCropper(tk.Toplevel):
         
         self.canvas.create_image(self.image_offset_x, self.image_offset_y, image=self.photo_image, anchor=tk.NW)
         
-        # Redraw the rectangle and handles (if they exist)
-        if self.rect_id:
-            self.draw_crop_rectangle()
+        # This is important: after updating the image, we must recalculate
+        # the initial crop rectangle based on the potentially new scale and offset.
+        # This will be handled by on_canvas_resize calling draw_initial_crop_rectangle.
 
-    def draw_initial_crop_rectangle(self):
-        # Ensure display_image is ready
-        if not self.display_image:
-            self.update_canvas_image()
 
-        img_width, img_height = self.display_image.size
+    def draw_initial_crop_rectangle(self, use_current_if_exists=False):
+        """
+        Draws the initial crop rectangle.
+        If initial_crop_coords_original is set, it uses that.
+        Otherwise, it calculates the largest possible square centered on the displayed image.
         
-        # Determine the size of the largest possible square on the displayed image
-        square_side = min(img_width, img_height)
+        :param use_current_if_exists: If True, and crop_x1/y1/x2/y2 are already set (e.g., from a drag),
+                                      it converts them to original, then back to new canvas coords,
+                                      effectively preserving the relative position/size.
+        """
         
-        # Calculate top-left corner for centering within the displayed image
-        self.crop_x1 = (img_width - square_side) / 2 + self.image_offset_x
-        self.crop_y1 = (img_height - square_side) / 2 + self.image_offset_y
-        
-        self.crop_x2 = self.crop_x1 + square_side
-        self.crop_y2 = self.crop_y1 + square_side
+        # First, convert current canvas crop coords to original image coords if needed
+        # This ensures that if the window was resized, the crop box scales appropriately.
+        if use_current_if_exists and self.rect_id:
+            # Get current crop box coords on canvas
+            current_canvas_x1, current_canvas_y1, current_canvas_x2, current_canvas_y2 = self.canvas.coords(self.rect_id)
+
+            # Convert to original image coordinates
+            crop_original_x1 = int((current_canvas_x1 - self.image_offset_x) * self.scale_factor_x)
+            crop_original_y1 = int((current_canvas_y1 - self.image_offset_y) * self.scale_factor_y)
+            crop_original_x2 = int((current_canvas_x2 - self.image_offset_x) * self.scale_factor_x)
+            crop_original_y2 = int((current_canvas_y2 - self.image_offset_y) * self.scale_factor_y)
+            
+            # Store these as the "initial" for this redraw
+            self.initial_crop_coords_original = (crop_original_x1, crop_original_y1, crop_original_x2, crop_original_y2)
+
+
+        if self.initial_crop_coords_original:
+            # If initial crop coordinates were provided (from previous session or last crop)
+            # Convert them from original image coordinates to current canvas coordinates
+            x1_orig, y1_orig, x2_orig, y2_orig = self.initial_crop_coords_original
+            
+            self.crop_x1 = self.image_offset_x + (x1_orig / self.scale_factor_x)
+            self.crop_y1 = self.image_offset_y + (y1_orig / self.scale_factor_y)
+            self.crop_x2 = self.image_offset_x + (x2_orig / self.scale_factor_x)
+            self.crop_y2 = self.image_offset_y + (y2_orig / self.scale_factor_y)
+
+            # Clamp to canvas image boundaries
+            self.crop_x1 = max(self.crop_x1, self.image_offset_x)
+            self.crop_y1 = max(self.crop_y1, self.image_offset_y)
+            self.crop_x2 = min(self.crop_x2, self.image_offset_x + self.display_image.width)
+            self.crop_y2 = min(self.crop_y2, self.image_offset_y + self.display_image.height)
+
+        else:
+            # Calculate the largest possible square that fits within the displayed image area on the canvas
+            # Ensure display_image is ready
+            if not self.display_image:
+                self.update_canvas_image() # This shouldn't be needed here if called from on_canvas_resize
+
+            displayed_img_width = self.display_image.width
+            displayed_img_height = self.display_image.height
+            
+            # Determine the side length of the largest possible square
+            square_side = min(displayed_img_width, displayed_img_height)
+            
+            # Calculate the top-left corner of this square, centered within the displayed image
+            offset_x_within_image = (displayed_img_width - square_side) / 2
+            offset_y_within_image = (displayed_img_height - square_side) / 2
+
+            # Convert these relative coordinates to canvas coordinates by adding the image_offset
+            self.crop_x1 = self.image_offset_x + offset_x_within_image
+            self.crop_y1 = self.image_offset_y + offset_y_within_image
+            
+            self.crop_x2 = self.crop_x1 + square_side
+            self.crop_y2 = self.crop_y1 + square_side
         
         self.draw_crop_rectangle()
+
 
     def draw_crop_rectangle(self):
         # Clear previous rectangle and handles
@@ -581,25 +647,23 @@ class ThumbnailCropper(tk.Toplevel):
             self.canvas.delete(handle_id)
         self.handle_ids.clear()
 
-        # Ensure x1<x2, y1<y2 for drawing
-        x1, y1 = min(self.crop_x1, self.crop_x2), min(self.crop_y1, self.crop_y2)
-        x2, y2 = max(self.crop_x1, self.crop_x2), max(self.crop_y1, self.crop_y2)
+        # Ensure x1<x2, y1<y2 for drawing (important for drag logic too)
+        # These are the actual drawing coordinates for the rectangle
+        draw_x1, draw_y1 = min(self.crop_x1, self.crop_x2), min(self.crop_y1, self.crop_y2)
+        draw_x2, draw_y2 = max(self.crop_x1, self.crop_x2), max(self.crop_y1, self.crop_y2)
 
         self.rect_id = self.canvas.create_rectangle(
-            x1, y1, x2, y2, outline="red", width=2, tags="crop_box"
+            draw_x1, draw_y1, draw_x2, draw_y2, outline="red", width=2, tags="crop_box"
         )
         
         # Draw handles
-        self.handle_ids.append(self.canvas.create_rectangle(x1 - self.HANDLE_SIZE/2, y1 - self.HANDLE_SIZE/2, x1 + self.HANDLE_SIZE/2, y1 + self.HANDLE_SIZE/2, fill="blue", tags="handle_NW"))
-        self.handle_ids.append(self.canvas.create_rectangle(x2 - self.HANDLE_SIZE/2, y1 - self.HANDLE_SIZE/2, x2 + self.HANDLE_SIZE/2, y1 + self.HANDLE_SIZE/2, fill="blue", tags="handle_NE"))
-        self.handle_ids.append(self.canvas.create_rectangle(x1 - self.HANDLE_SIZE/2, y2 - self.HANDLE_SIZE/2, x1 + self.HANDLE_SIZE/2, y2 + self.HANDLE_SIZE/2, fill="blue", tags="handle_SW"))
-        self.handle_ids.append(self.canvas.create_rectangle(x2 - self.HANDLE_SIZE/2, y2 - self.HANDLE_SIZE/2, x2 + self.HANDLE_SIZE/2, y2 + self.HANDLE_SIZE/2, fill="blue", tags="handle_SE"))
+        self.handle_ids.append(self.canvas.create_rectangle(draw_x1 - self.HANDLE_SIZE/2, draw_y1 - self.HANDLE_SIZE/2, draw_x1 + self.HANDLE_SIZE/2, draw_y1 + self.HANDLE_SIZE/2, fill="blue", tags="handle_NW"))
+        self.handle_ids.append(self.canvas.create_rectangle(draw_x2 - self.HANDLE_SIZE/2, draw_y1 - self.HANDLE_SIZE/2, draw_x2 + self.HANDLE_SIZE/2, draw_y1 + self.HANDLE_SIZE/2, fill="blue", tags="handle_NE"))
+        self.handle_ids.append(self.canvas.create_rectangle(draw_x1 - self.HANDLE_SIZE/2, draw_y2 - self.HANDLE_SIZE/2, draw_x1 + self.HANDLE_SIZE/2, draw_y2 + self.HANDLE_SIZE/2, fill="blue", tags="handle_SW"))
+        self.handle_ids.append(self.canvas.create_rectangle(draw_x2 - self.HANDLE_SIZE/2, draw_y2 - self.HANDLE_SIZE/2, draw_x2 + self.HANDLE_SIZE/2, draw_y2 + self.HANDLE_SIZE/2, fill="blue", tags="handle_SE"))
 
     def get_handle_type(self, x, y):
-        x1, y1 = min(self.crop_x1, self.crop_y1), min(self.crop_x1, self.crop_y2) # Corrected logic
-        x2, y2 = max(self.crop_x1, self.crop_x2), max(self.crop_y1, self.crop_y2)
-
-        # Re-calculate correct x1, y1, x2, y2 based on self.crop_x1/y1/x2/y2 being potentially unordered
+        # Use the potentially unordered self.crop_x/y for getting the actual current bounds
         current_x1, current_y1 = min(self.crop_x1, self.crop_x2), min(self.crop_y1, self.crop_y2)
         current_x2, current_y2 = max(self.crop_x1, self.crop_x2), max(self.crop_y1, self.crop_y2)
 
@@ -640,10 +704,10 @@ class ThumbnailCropper(tk.Toplevel):
         self.dragging_mode = self.get_handle_type(event.x, event.y)
 
         # Store current crop coordinates for calculations
-        self.initial_crop_x1 = self.crop_x1
-        self.initial_crop_y1 = self.crop_y1
-        self.initial_crop_x2 = self.crop_x2
-        self.initial_crop_y2 = self.crop_y2
+        self.initial_drag_crop_x1 = self.crop_x1
+        self.initial_drag_crop_y1 = self.crop_y1
+        self.initial_drag_crop_x2 = self.crop_x2
+        self.initial_drag_crop_y2 = self.crop_y2
 
     def on_mouse_drag(self, event):
         dx = event.x - self.drag_start_x
@@ -655,23 +719,24 @@ class ThumbnailCropper(tk.Toplevel):
         img_x2 = self.image_offset_x + self.display_image.width
         img_y2 = self.image_offset_y + self.display_image.height
 
-        # Ensure current crop coordinates are ordered for calculations
-        current_x1_ordered, current_y1_ordered = min(self.initial_crop_x1, self.initial_crop_x2), min(self.initial_crop_y1, self.initial_crop_y2)
-        current_x2_ordered, current_y2_ordered = max(self.initial_crop_x1, self.initial_crop_x2), max(self.initial_crop_y1, self.initial_crop_y2)
+        # Ensure current crop coordinates from initial_drag are ordered for calculations
+        current_x1_ordered, current_y1_ordered = min(self.initial_drag_crop_x1, self.initial_drag_crop_x2), min(self.initial_drag_crop_y1, self.initial_drag_crop_y2)
+        current_x2_ordered, current_y2_ordered = max(self.initial_drag_crop_x1, self.initial_drag_crop_x2), max(self.initial_drag_crop_y1, self.initial_drag_crop_y2)
         
         current_width = current_x2_ordered - current_x1_ordered
         current_height = current_y2_ordered - current_y1_ordered
-        current_side = current_width # Since it's a square, width and height are the same
+        
+        min_size = self.HANDLE_SIZE * 2 # Minimum side length for the crop box
 
         if self.dragging_mode == 'move':
-            new_x1 = self.initial_crop_x1 + dx
-            new_y1 = self.initial_crop_y1 + dy
-            new_x2 = self.initial_crop_x2 + dx
-            new_y2 = self.initial_crop_y2 + dy
+            new_x1 = self.initial_drag_crop_x1 + dx
+            new_y1 = self.initial_drag_crop_y1 + dy
+            new_x2 = self.initial_drag_crop_x2 + dx
+            new_y2 = self.initial_drag_crop_y2 + dy
 
             # Clamp movement to image boundaries
-            width = self.initial_crop_x2 - self.initial_crop_x1
-            height = self.initial_crop_y2 - self.initial_crop_y1 # Should be same as width
+            width = self.initial_drag_crop_x2 - self.initial_drag_crop_x1
+            height = self.initial_drag_crop_y2 - self.initial_drag_crop_y1
 
             if new_x1 < img_x1:
                 new_x1 = img_x1
@@ -691,95 +756,145 @@ class ThumbnailCropper(tk.Toplevel):
             self.draw_crop_rectangle()
 
         elif 'resize' in self.dragging_mode:
-            min_size = 10 # Minimum side length for the crop box
-
+            # The goal is to maintain a square aspect ratio while resizing
+            
+            # Calculate proposed new dimensions based on drag
             if self.dragging_mode == 'resize_corner_NW':
-                new_x1 = current_x1_ordered + dx
-                new_y1 = current_y1_ordered + dy
-
-                # Ensure we don't go past the opposite corner (SE)
-                new_x1 = min(new_x1, current_x2_ordered - min_size)
-                new_y1 = min(new_y1, current_y2_ordered - min_size)
-
-                # Clamp to image boundaries
-                new_x1 = max(new_x1, img_x1)
-                new_y1 = max(new_y1, img_y1)
-
-                # Calculate new side based on clamped new_x1, new_y1
-                candidate_side_x = current_x2_ordered - new_x1
-                candidate_side_y = current_y2_ordered - new_y1
+                proposed_x1 = event.x
+                proposed_y1 = event.y
                 
-                final_side = min(candidate_side_x, candidate_side_y)
-                final_side = max(min_size, final_side) # Ensure min size
+                # Calculate new side based on distance from opposite corner (current_x2_ordered, current_y2_ordered)
+                candidate_width = current_x2_ordered - proposed_x1
+                candidate_height = current_y2_ordered - proposed_y1
+                
+                new_side = min(candidate_width, candidate_height)
+                new_side = max(min_size, new_side) # Ensure min size
 
-                self.crop_x1 = current_x2_ordered - final_side
-                self.crop_y1 = current_y2_ordered - final_side
+                # Calculate new (x1, y1) based on new_side and opposite corner
+                new_x1 = current_x2_ordered - new_side
+                new_y1 = current_y2_ordered - new_side
+
+                # Clamp proposed x1, y1 to image bounds
+                new_x1 = max(img_x1, new_x1)
+                new_y1 = max(img_y1, new_y1)
+
+                # Adjust new_side if clamping occurred, maintaining square aspect
+                if new_x1 == img_x1:
+                    new_side = current_x2_ordered - img_x1
+                if new_y1 == img_y1:
+                    new_side = current_y2_ordered - img_y1
+                new_side = min(new_side, current_x2_ordered - img_x1, current_y2_ordered - img_y1)
+                new_side = max(min_size, new_side)
+
+                self.crop_x1 = current_x2_ordered - new_side
+                self.crop_y1 = current_y2_ordered - new_side
                 self.crop_x2 = current_x2_ordered
                 self.crop_y2 = current_y2_ordered
-                
+
             elif self.dragging_mode == 'resize_corner_NE':
-                new_x2 = current_x2_ordered + dx
-                new_y1 = current_y1_ordered + dy
+                proposed_x2 = event.x
+                proposed_y1 = event.y
 
-                new_x2 = max(new_x2, current_x1_ordered + min_size)
-                new_y1 = min(new_y1, current_y2_ordered - min_size)
-
-                new_x2 = min(new_x2, img_x2)
-                new_y1 = max(new_y1, img_y1)
+                candidate_width = proposed_x2 - current_x1_ordered
+                candidate_height = current_y2_ordered - proposed_y1
                 
-                candidate_side_x = new_x2 - current_x1_ordered
-                candidate_side_y = current_y2_ordered - new_y1
+                new_side = min(candidate_width, candidate_height)
+                new_side = max(min_size, new_side)
 
-                final_side = min(candidate_side_x, candidate_side_y)
-                final_side = max(min_size, final_side)
+                # Clamp proposed x2, y1 to image bounds
+                new_x2 = min(img_x2, proposed_x2)
+                new_y1 = max(img_y1, proposed_y1)
+
+                # Adjust new_side if clamping occurred
+                if new_x2 == img_x2:
+                    new_side = img_x2 - current_x1_ordered
+                if new_y1 == img_y1:
+                    new_side = current_y2_ordered - img_y1
+                new_side = min(new_side, img_x2 - current_x1_ordered, current_y2_ordered - img_y1)
+                new_side = max(min_size, new_side)
 
                 self.crop_x1 = current_x1_ordered
-                self.crop_y1 = current_y2_ordered - final_side
-                self.crop_x2 = current_x1_ordered + final_side
+                self.crop_y1 = current_y2_ordered - new_side
+                self.crop_x2 = current_x1_ordered + new_side
                 self.crop_y2 = current_y2_ordered
 
             elif self.dragging_mode == 'resize_corner_SW':
-                new_x1 = current_x1_ordered + dx
-                new_y2 = current_y2_ordered + dy
+                proposed_x1 = event.x
+                proposed_y2 = event.y
 
-                new_x1 = min(new_x1, current_x2_ordered - min_size)
-                new_y2 = max(new_y2, current_y1_ordered + min_size)
+                candidate_width = current_x2_ordered - proposed_x1
+                candidate_height = proposed_y2 - current_y1_ordered
 
-                new_x1 = max(new_x1, img_x1)
-                new_y2 = min(new_y2, img_y2)
+                new_side = min(candidate_width, candidate_height)
+                new_side = max(min_size, new_side)
 
-                candidate_side_x = current_x2_ordered - new_x1
-                candidate_side_y = new_y2 - current_y1_ordered
+                # Clamp proposed x1, y2 to image bounds
+                new_x1 = max(img_x1, proposed_x1)
+                new_y2 = min(img_y2, proposed_y2)
 
-                final_side = min(candidate_side_x, candidate_side_y)
-                final_side = max(min_size, final_side)
+                # Adjust new_side if clamping occurred
+                if new_x1 == img_x1:
+                    new_side = current_x2_ordered - img_x1
+                if new_y2 == img_y2:
+                    new_side = img_y2 - current_y1_ordered
+                new_side = min(new_side, current_x2_ordered - img_x1, img_y2 - current_y1_ordered)
+                new_side = max(min_size, new_side)
 
-                self.crop_x1 = current_x2_ordered - final_side
+                self.crop_x1 = current_x2_ordered - new_side
                 self.crop_y1 = current_y1_ordered
                 self.crop_x2 = current_x2_ordered
-                self.crop_y2 = current_y1_ordered + final_side
+                self.crop_y2 = current_y1_ordered + new_side
 
             elif self.dragging_mode == 'resize_corner_SE':
-                new_x2 = current_x2_ordered + dx
-                new_y2 = current_y2_ordered + dy
+                proposed_x2 = event.x
+                proposed_y2 = event.y
 
-                new_x2 = max(new_x2, current_x1_ordered + min_size)
-                new_y2 = max(new_y2, current_y1_ordered + min_size)
+                candidate_width = proposed_x2 - current_x1_ordered
+                candidate_height = proposed_y2 - current_y1_ordered
 
-                new_x2 = min(new_x2, img_x2)
-                new_y2 = min(new_y2, img_y2)
-                
-                candidate_side_x = new_x2 - current_x1_ordered
-                candidate_side_y = new_y2 - current_y1_ordered
+                new_side = min(candidate_width, candidate_height)
+                new_side = max(min_size, new_side)
 
-                final_side = min(candidate_side_x, candidate_side_y)
-                final_side = max(min_size, final_side)
+                # Clamp proposed x2, y2 to image bounds
+                new_x2 = min(img_x2, proposed_x2)
+                new_y2 = min(img_y2, proposed_y2)
+
+                # Adjust new_side if clamping occurred
+                if new_x2 == img_x2:
+                    new_side = img_x2 - current_x1_ordered
+                if new_y2 == img_y2:
+                    new_side = img_y2 - current_y1_ordered
+                new_side = min(new_side, img_x2 - current_x1_ordered, img_y2 - current_y1_ordered)
+                new_side = max(min_size, new_side)
 
                 self.crop_x1 = current_x1_ordered
                 self.crop_y1 = current_y1_ordered
-                self.crop_x2 = current_x1_ordered + final_side
-                self.crop_y2 = current_y1_ordered + final_side
+                self.crop_x2 = current_x1_ordered + new_side
+                self.crop_y2 = current_y1_ordered + new_side
+            
+            # After calculating the new_side and updating crop_x/y based on the new side,
+            # we need to ensure the entire box remains within the image.
+            # This handles cases where the calculated new_side might cause the box
+            # to exceed bounds if the initial corner was already near the edge.
 
+            # Ensure the top-left is not less than image bounds
+            self.crop_x1 = max(img_x1, self.crop_x1)
+            self.crop_y1 = max(img_y1, self.crop_y1)
+
+            # Ensure the bottom-right is not greater than image bounds
+            # If the right edge is out, pull it back and adjust left
+            if self.crop_x2 > img_x2:
+                self.crop_x2 = img_x2
+                self.crop_x1 = self.crop_x2 - new_side # Maintain size
+            # If the bottom edge is out, pull it back and adjust top
+            if self.crop_y2 > img_y2:
+                self.crop_y2 = img_y2
+                self.crop_y1 = self.crop_y2 - new_side # Maintain size
+            
+            # Re-clamp top-left after potential bottom-right adjustment
+            self.crop_x1 = max(img_x1, self.crop_x1)
+            self.crop_y1 = max(img_y1, self.crop_y1)
+            
             self.draw_crop_rectangle()
 
     def on_button_release(self, event):
@@ -789,12 +904,8 @@ class ThumbnailCropper(tk.Toplevel):
         self.canvas.config(cursor="arrow") # Reset cursor
 
     def perform_crop(self):
-        # Get the current coordinates of the rectangle object
+        # Get the current coordinates of the rectangle object (these are already ordered by draw_crop_rectangle)
         x1_canvas, y1_canvas, x2_canvas, y2_canvas = self.canvas.coords(self.rect_id)
-
-        # Reorder coordinates to ensure x1 < x2 and y1 < y2
-        x1_canvas, x2_canvas = min(x1_canvas, x2_canvas), max(x1_canvas, x2_canvas)
-        y1_canvas, y2_canvas = min(y1_canvas, y2_canvas), max(y1_canvas, y2_canvas)
 
         # Adjust for image offset on canvas
         crop_original_x1 = int((x1_canvas - self.image_offset_x) * self.scale_factor_x)
@@ -815,10 +926,14 @@ class ThumbnailCropper(tk.Toplevel):
         cropped_image.save(byte_arr, format='JPEG') # Assuming JPEG for thumbnails
         self.cropped_image_data = byte_arr.getvalue()
         
+        # Store the original image coordinates of the *final* crop for next time
+        self.cropped_original_coords = (crop_original_x1, crop_original_y1, crop_original_x2, crop_original_y2)
+
         self.destroy()
 
     def cancel_crop(self):
         self.cropped_image_data = None
+        self.cropped_original_coords = None # Indicate no crop was performed/saved
         self.destroy()
 
 class YouTubeAlbumSplitterGUI:
@@ -827,7 +942,7 @@ class YouTubeAlbumSplitterGUI:
         self.root.title("YouTube Album Splitter")
         self.root.geometry("1000x750")  # Slightly taller for player controls
         
-        self.splitter = YouTubeAlbumSplitter()
+        self.splitter = YouTubeAlbumSplitter(self) # Pass self reference
         self.preview = AudioPreview()
         self.tracks = []
         
@@ -837,6 +952,8 @@ class YouTubeAlbumSplitterGUI:
         self.thumbnail_label = None
         self.thumbnail_data = None # Store the initially fetched thumbnail data
         self.cropped_thumbnail_data = None # Store the final (potentially cropped) thumbnail data
+        self.last_cropped_original_coords = None # Store the original image coordinates of the last crop
+        
         self.setup_ui()
 
     def setup_ui(self):
@@ -946,6 +1063,7 @@ class YouTubeAlbumSplitterGUI:
         # Clear previous thumbnail if any
         self.thumbnail_data = None
         self.cropped_thumbnail_data = None
+        self.last_cropped_original_coords = None # Reset crop history for new video
         self.thumbnail_label.config(image='')
         self.thumbnail_label.image = None
 
@@ -1140,29 +1258,49 @@ class YouTubeAlbumSplitterGUI:
         button_frame = ttk.Frame(crop_dialog)
         button_frame.pack(pady=10)
         
-        ttk.Button(button_frame, text="Crop", command=lambda: self.start_cropping(crop_dialog)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Crop", command=lambda: self.start_cropping(dialog=crop_dialog, force_new_crop=True)).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Use As Is", command=lambda: self.use_thumbnail_as_is(crop_dialog)).pack(side=tk.LEFT, padx=5)
         
         crop_dialog.transient(self.root)
         crop_dialog.grab_set()
         self.root.wait_window(crop_dialog) # Make sure this dialog blocks until closed
 
-    def start_cropping(self, dialog):
-        dialog.destroy()
-        cropper = ThumbnailCropper(self.root, self.thumbnail_data)
+    def start_cropping(self, dialog=None, force_new_crop=False):
+        """
+        Starts the ThumbnailCropper window.
+        :param dialog: The current dialog (e.g., show_thumbnail_with_crop_option) to destroy.
+        :param force_new_crop: If True, it will ignore last_cropped_original_coords and force a default initial crop.
+        """
+        if dialog:
+            dialog.destroy()
+        
+        initial_coords_to_pass = None
+        if not force_new_crop and self.last_cropped_original_coords:
+            initial_coords_to_pass = self.last_cropped_original_coords
+
+        cropper = ThumbnailCropper(self.root, self.thumbnail_data, initial_crop_coords=initial_coords_to_pass)
         self.root.wait_window(cropper) # Wait for cropper window to close
         
         if hasattr(cropper, 'cropped_image_data') and cropper.cropped_image_data is not None:
             self.cropped_thumbnail_data = cropper.cropped_image_data
+            self.last_cropped_original_coords = cropper.cropped_original_coords # Store the new original coords
             self.display_final_thumbnail()
         else:
-            # If cropping was canceled, revert to the original uncropped image data
-            self.cropped_thumbnail_data = self.thumbnail_data
+            # If cropping was canceled or failed, revert to the *last known* good thumbnail data
+            # If it's the very first time and canceled, it will be the original full thumbnail
+            if self.last_cropped_original_coords is None:
+                # If no crop was ever set, and cancel, then use the original full thumbnail
+                self.cropped_thumbnail_data = self.thumbnail_data
+            # Else, self.cropped_thumbnail_data already holds the previous cropped state or original.
             self.display_final_thumbnail()
     
     def use_thumbnail_as_is(self, dialog):
         dialog.destroy()
         self.cropped_thumbnail_data = self.thumbnail_data # Confirm using original
+        # When using as-is, the effective "crop" is the entire original image.
+        # So, we set last_cropped_original_coords to the full dimensions of the original image.
+        original_img = Image.open(BytesIO(self.thumbnail_data))
+        self.last_cropped_original_coords = (0, 0, original_img.width, original_img.height)
         self.display_final_thumbnail()
     
     def display_final_thumbnail(self):
@@ -1173,6 +1311,7 @@ class YouTubeAlbumSplitterGUI:
                 img.thumbnail((150, 150))  # Display size on main UI
                 
                 # Make sure it's square for consistent display if not already from cropping
+                # This ensures the preview on the main window is always square, regardless of crop shape
                 if img.width != img.height:
                     size = min(img.width, img.height)
                     left = (img.width - size) / 2
@@ -1257,16 +1396,9 @@ class YouTubeAlbumSplitterGUI:
             messagebox.showwarning("No Thumbnail", "Please download a video first to get a thumbnail.")
             return
         
-        # We start the cropping process with the original downloaded thumbnail data
-        cropper = ThumbnailCropper(self.root, self.thumbnail_data)
-        self.root.wait_window(cropper) 
-        
-        if hasattr(cropper, 'cropped_image_data') and cropper.cropped_image_data is not None:
-            self.cropped_thumbnail_data = cropper.cropped_image_data
-            self.display_final_thumbnail()
-        else:
-            # If cropping was canceled, simply ensure the last valid thumbnail is displayed
-            self.display_final_thumbnail()
+        # Call start_cropping, passing the last known cropped coordinates if available.
+        # This will ensure the cropper starts with the previous bounds.
+        self.start_cropping(dialog=None, force_new_crop=False)
 
 
     def on_closing(self):
