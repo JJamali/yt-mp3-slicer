@@ -1418,13 +1418,6 @@ class YouTubeAlbumSplitterGUI:
             self.thumbnail_label.config(image='')
             self.thumbnail_label.image = None
 
-
-    # This method is now handled by player_controls.stop_playback(),
-    # and the old AudioPreview instance is removed.
-    # def stop_preview(self):
-    #     self.player_controls.stop_playback() # This will handle stopping pygame and temp files are cleaned
-    #     self.status_var.set("Preview stopped")
-    
     def browse_output(self):
         directory = filedialog.askdirectory()
         if directory:
