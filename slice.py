@@ -1373,11 +1373,29 @@ class YouTubeAlbumSplitterGUI:
     
     def use_thumbnail_as_is(self, dialog):
         dialog.destroy()
-        self.cropped_thumbnail_data = self.thumbnail_data # Confirm using original
-        # When using as-is, the effective "crop" is the entire original image.
-        # So, we set last_cropped_original_coords to the full dimensions of the original image.
+        
+        # Open the original thumbnail data
         original_img = Image.open(BytesIO(self.thumbnail_data))
-        self.last_cropped_original_coords = (0, 0, original_img.width, original_img.height)
+        
+        # Calculate the largest possible square that fits within the original image
+        img_width, img_height = original_img.size
+        square_side = min(img_width, img_height)
+        
+        left = (img_width - square_side) // 2
+        top = (img_height - square_side) // 2
+        right = left + square_side
+        bottom = top + square_side
+        
+        # Crop the original image to this square
+        cropped_square_img = original_img.crop((left, top, right, bottom))
+        
+        # Convert the cropped square image to bytes
+        byte_arr = BytesIO()
+        cropped_square_img.save(byte_arr, format='JPEG') # Assuming JPEG for thumbnails
+        self.cropped_thumbnail_data = byte_arr.getvalue()
+        
+        # Store the original image coordinates of this new square crop
+        self.last_cropped_original_coords = (left, top, right, bottom)
         self.display_final_thumbnail()
     
     def display_final_thumbnail(self):
@@ -1386,16 +1404,6 @@ class YouTubeAlbumSplitterGUI:
             try:
                 img = Image.open(BytesIO(self.cropped_thumbnail_data))
                 img.thumbnail((150, 150))  # Display size on main UI
-                
-                # Make sure it's square for consistent display if not already from cropping
-                # This ensures the preview on the main window is always square, regardless of crop shape
-                if img.width != img.height:
-                    size = min(img.width, img.height)
-                    left = (img.width - size) / 2
-                    top = (img.height - size) / 2
-                    right = (img.width + size) / 2
-                    bottom = (img.height + size) / 2
-                    img = img.crop((left, top, right, bottom))
                 
                 photo = ImageTk.PhotoImage(img)
                 
