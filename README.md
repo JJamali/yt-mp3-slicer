@@ -14,4 +14,4 @@ I got tired of manually splitting MP3s from albums I could only find on youtube.
 
 3. Run: `python youtube_splitter.py`
 
-![alt text](GUI_image.png)
+<img width="1988" height="1542" alt="image" src="https://github.com/user-attachments/assets/279815a1-70a6-48a6-92fc-e80fa42fc555" />
