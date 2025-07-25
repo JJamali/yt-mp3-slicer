@@ -56,7 +56,7 @@ class YouTubeAlbumSplitter:
         if hours > 0:
             return f"{hours}:{minutes:02d}:{secs:02d}"
         else:
-            return f"{minutes}:{secs:02d}"
+            return f"{minutes:02d}:{secs:02d}"
     
     def extract_timestamps_from_description(self, description: str) -> List[Track]:
         """Extract track information from video description"""
@@ -217,7 +217,8 @@ class YouTubeAlbumSplitter:
             ])
             
             try:
-                subprocess.run(cmd, check=True, capture_output=True)
+                # Removed creationflags=subprocess.CREATE_NO_WINDOW
+                subprocess.run(cmd, check=True, capture_output=True) 
                 
                 # Add metadata and thumbnail
                 if final_thumbnail_data:
@@ -260,64 +261,27 @@ class YouTubeAlbumSplitter:
         if self.audio_file and os.path.exists(self.audio_file):
             os.remove(self.audio_file)
 
-class AudioPreview:
-    def __init__(self):
-        pygame.mixer.init()
-        self.current_preview = None
-        self.is_playing = False
-    
-    def create_preview(self, audio_file: str, start_time: int, duration: int = 30) -> str:
-        """Create a preview file for the given time range"""
-        preview_file = tempfile.mktemp(suffix='.mp3')
-        
-        cmd = [
-            'ffmpeg', '-i', audio_file,
-            '-ss', str(start_time),
-            '-t', str(duration),
-            '-acodec', 'mp3',
-            '-ab', '128k',
-            '-y', preview_file
-        ]
-        
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            return preview_file
-        except subprocess.CalledProcessError:
-            return None
-    
-    def play_preview(self, preview_file: str):
-        """Play the preview file"""
-        try:
-            pygame.mixer.music.load(preview_file)
-            pygame.mixer.music.play()
-            self.is_playing = True
-        except pygame.error:
-            pass
-    
-    def stop_preview(self):
-        """Stop the current preview"""
-        pygame.mixer.music.stop()
-        self.is_playing = False
-        if self.current_preview and os.path.exists(self.current_preview):
-            try:
-                os.remove(self.current_preview)
-            except OSError:
-                pass
-        self.current_preview = None
+# The AudioPreview class is largely removed, its core functionality for creating temporary
+# preview files is moved into AudioPlayerControl, and its playback logic directly uses pygame.mixer.
+# This simplifies the architecture by removing a redundant abstraction layer for previews.
 
 class AudioPlayerControl(ttk.Frame):
-    def __init__(self, parent, preview_manager):
+    def __init__(self, parent, root_gui_ref): # Renamed `preview_manager` to `root_gui_ref`
         super().__init__(parent)
-        self.preview = preview_manager
+        pygame.mixer.init() # Initialize mixer once here
+        self.root_gui_ref = root_gui_ref # Reference to the main GUI instance
         self.is_playing = False
         self.current_position = 0
         self.duration = 0
+        self.preview_file = None # To store the path of the current temporary preview file
+        self.playback_start_offset = 0 # Added for accurate seek/playback position
         self.setup_ui()
         self.update_interval = 250  # ms
         self.after_id = None
 
     def setup_ui(self):
         # Playback controls
+        # Unified Play/Pause button
         self.play_btn = ttk.Button(self, text="▶", width=3, command=self.toggle_playback)
         self.play_btn.grid(row=0, column=0, padx=5)
         
@@ -363,51 +327,149 @@ class AudioPlayerControl(ttk.Frame):
         # Configure grid weights
         self.columnconfigure(3, weight=1)
 
+    def load_track_for_playback(self, track: Track):
+        """
+        Loads a portion of the selected track for immediate playback control.
+        Creates a temporary preview file for this purpose.
+        """
+        self.stop_playback() # Stop and clear any existing preview
+
+        if not self.root_gui_ref.splitter.audio_file:
+            self.set_duration(0)
+            self.root_gui_ref.status_var.set("Please download audio first to preview tracks.")
+            return
+
+        try:
+            start_sec = self.root_gui_ref.splitter.parse_timestamp(track.start_time)
+            
+            # Determine the effective end time for the preview
+            end_sec_for_preview = None
+            if track.end_time:
+                end_sec_for_preview = self.root_gui_ref.splitter.parse_timestamp(track.end_time)
+            else:
+                # If no explicit end time, determine the end of the full audio file
+                # Use mutagen to get the total duration of the downloaded audio file
+                full_audio = MP3(self.root_gui_ref.splitter.audio_file)
+                end_sec_for_preview = int(full_audio.info.length)
+
+            # Calculate the duration for the preview
+            if end_sec_for_preview is not None:
+                preview_length_sec = end_sec_for_preview - start_sec
+            else:
+                # This case should ideally not happen if end_sec_for_preview is always set.
+                # As a fallback, use remaining duration from start_sec to end of whole audio.
+                full_audio = MP3(self.root_gui_ref.splitter.audio_file)
+                preview_length_sec = int(full_audio.info.length) - start_sec
+
+            if preview_length_sec <= 0:
+                self.root_gui_ref.status_var.set("Track has zero or negative duration. Cannot preview.")
+                return
+
+            self.root_gui_ref.status_var.set(f"Creating preview for: {track.title}...")
+            
+            # Create a temporary preview file
+            self.preview_file = tempfile.mktemp(suffix='.mp3')
+            cmd = [
+                'ffmpeg', '-i', self.root_gui_ref.splitter.audio_file,
+                '-ss', str(start_sec),
+                '-t', str(preview_length_sec),
+                '-acodec', 'libmp3lame', # Use libmp3lame for better quality/compatibility
+                '-q:a', '4', # Variable bitrate, good quality
+                '-y', self.preview_file
+            ]
+            # Removed creationflags=subprocess.CREATE_NO_WINDOW
+            subprocess.run(cmd, check=True, capture_output=True) 
+            
+            pygame.mixer.music.load(self.preview_file)
+            self.set_duration(preview_length_sec) # Set duration for slider
+            self.play_btn.config(text="▶") # Set to play symbol
+            self.current_position = 0
+            self.seek_var.set(0)
+            self.update_time_display()
+            self.root_gui_ref.status_var.set(f"Loaded for playback: {track.title}")
+
+        except subprocess.CalledProcessError as e:
+            messagebox.showerror("Error", f"Failed to create preview: {e.stderr.decode()}")
+            self.reset()
+            self.root_gui_ref.status_var.set("Error creating preview.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error loading track for playback: {e}")
+            self.reset()
+            self.root_gui_ref.status_var.set("Error loading track.")
+
     def toggle_playback(self):
+        if self.preview_file is None:
+            self.root_gui_ref.status_var.set("No track loaded. Select a track to play.")
+            return
+
         if self.is_playing:
             self.pause_playback()
         else:
             self.start_playback()
 
     def start_playback(self):
-        if not pygame.mixer.music.get_busy():
-            pygame.mixer.music.play()
+        if self.preview_file is None: return # Should not happen if called after load_track_for_playback
+
+        if not pygame.mixer.music.get_busy() or pygame.mixer.music.get_pos() == -1: # -1 means stopped or not playing
+            pygame.mixer.music.play(start=self.current_position) # Start from current position
+            self.playback_start_offset = self.current_position # Store the offset
         else:
             pygame.mixer.music.unpause()
         
         self.is_playing = True
         self.play_btn.config(text="❚❚")  # Pause symbol
         self.update_playback_position()
+        self.root_gui_ref.status_var.set("Playing...")
 
     def pause_playback(self):
+        if self.preview_file is None: return
         pygame.mixer.music.pause()
         self.is_playing = False
         self.play_btn.config(text="▶")
         if self.after_id:
             self.after_cancel(self.after_id)
             self.after_id = None
+        self.root_gui_ref.status_var.set("Paused.")
+
 
     def stop_playback(self):
         pygame.mixer.music.stop()
         self.is_playing = False
         self.play_btn.config(text="▶")
         self.current_position = 0
+        self.playback_start_offset = 0 # Reset offset on stop
         self.seek_var.set(0)
         self.update_time_display()
         if self.after_id:
             self.after_cancel(self.after_id)
             self.after_id = None
+        
+        # Clean up the temporary preview file
+        if self.preview_file and os.path.exists(self.preview_file):
+            try:
+                os.remove(self.preview_file)
+            except OSError:
+                pass # File might still be in use by pygame for a moment, best effort
+        self.preview_file = None
+        self.root_gui_ref.status_var.set("Playback stopped.")
+
 
     def on_seek(self, value):
-        if not self.preview.current_preview:
+        if not self.preview_file: # Use self.preview_file to check if a track is loaded
             return
             
-        seek_pos = float(value)
+        seek_pos_percent = float(value)
         if self.duration > 0:
-            new_pos = (seek_pos / 100) * self.duration
-            pygame.mixer.music.set_pos(new_pos)
-            self.current_position = new_pos
+            # pygame.mixer.music.set_pos uses seconds relative to the loaded track
+            new_pos_seconds = (seek_pos_percent / 100) * self.duration
+            pygame.mixer.music.set_pos(new_pos_seconds)
+            self.current_position = new_pos_seconds # Update our internal position tracker
+            self.playback_start_offset = new_pos_seconds # Set offset to the new seek position
             self.update_time_display()
+
+            if self.is_playing: # If playing, restart playback from new position
+                pygame.mixer.music.play(start=new_pos_seconds) # Restart from new position
+                self.update_playback_position() # Restart the update loop
 
     def on_volume_change(self, value):
         volume = float(value) / 100
@@ -423,21 +485,33 @@ class AudioPlayerControl(ttk.Frame):
             self.volume_icon.config(text="🔊")
 
     def update_playback_position(self):
-        if pygame.mixer.music.get_busy():
-            # Get current position (pygame doesn't provide this directly, so we estimate)
-            self.current_position += self.update_interval / 1000
-            if self.current_position > self.duration:
-                self.current_position = self.duration
+        # pygame.mixer.music.get_pos() returns milliseconds since playback started for the *current* play() call
+        # It resets when play() is called, so we need to track overall position.
+        if self.is_playing:
+            mixer_pos_ms = pygame.mixer.music.get_pos()
+            if mixer_pos_ms != -1: # if music is actively playing
+                current_mixer_time_s = (mixer_pos_ms / 1000.0) 
+                
+                # Calculate actual current position by adding the playback_start_offset
+                self.current_position = self.playback_start_offset + current_mixer_time_s
+                
+                # Check if playback has finished for the loaded preview file
+                if self.current_position >= self.duration - 0.1: # Allow for slight floating point inaccuracies
+                    self.stop_playback()
+                    return # Exit recursion
+
+                # Update seek slider
+                if self.duration > 0:
+                    self.seek_var.set((self.current_position / self.duration) * 100)
+                
+                self.update_time_display()
+            else:
+                # If get_pos() returns -1, it might mean playback finished or stopped unexpectedly
                 self.stop_playback()
-            
-            # Update seek slider
-            if self.duration > 0:
-                self.seek_var.set((self.current_position / self.duration) * 100)
-            
-            self.update_time_display()
+                return
+
             self.after_id = self.after(self.update_interval, self.update_playback_position)
-        else:
-            self.stop_playback()
+        # else: if not is_playing, the loop is already cancelled by pause/stop_playback
 
     def update_time_display(self):
         current_str = self.format_time(self.current_position)
@@ -459,6 +533,7 @@ class AudioPlayerControl(ttk.Frame):
         self.stop_playback()
         self.duration = 0
         self.current_position = 0
+        self.playback_start_offset = 0 # Reset offset
         self.seek_var.set(0)
         self.update_time_display()
 
@@ -476,6 +551,8 @@ class ThumbnailCropper(tk.Toplevel):
         self.parent = parent
         self.image_data = image_data
         self.initial_crop_coords_original = initial_crop_coords # Store original coords
+        self.cropped_image_data = None  # To store the result of the crop
+        self.cropped_original_coords = None # To store the coords of the result in original image system
         
         self.original_image = Image.open(BytesIO(image_data))
         self.display_image = None # Will store the scaled image for display
@@ -532,7 +609,7 @@ class ThumbnailCropper(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self.cancel_crop)
         self.transient(parent) # Make it modal
         self.grab_set() # Grab all events for this window
-        self.parent.wait_window(self) # Wait until this window is closed
+        # self.parent.wait_window(self) # Removed: This will be called by the parent (YouTubeAlbumSplitterGUI)
 
     def on_canvas_resize(self, event):
         # Update canvas dimensions when window is resized
@@ -736,7 +813,7 @@ class ThumbnailCropper(tk.Toplevel):
 
             # Clamp movement to image boundaries
             width = self.initial_drag_crop_x2 - self.initial_drag_crop_x1
-            height = self.initial_drag_crop_y2 - self.initial_drag_crop_y1
+            height = self.initial_drag_crop_y2 - self.initial_crop_y1 # Corrected: initial_drag_crop_y1 instead of initial_crop_y1
 
             if new_x1 < img_x1:
                 new_x1 = img_x1
@@ -943,11 +1020,11 @@ class YouTubeAlbumSplitterGUI:
         self.root.geometry("1000x750")  # Slightly taller for player controls
         
         self.splitter = YouTubeAlbumSplitter(self) # Pass self reference
-        self.preview = AudioPreview()
+        # self.preview = AudioPreview() # AudioPreview is no longer a separate instance here
         self.tracks = []
         
-        # Initialize pygame mixer
-        pygame.mixer.init()
+        # Pygame mixer initialization is now handled by AudioPlayerControl internally
+        # pygame.mixer.init()
         
         self.thumbnail_label = None
         self.thumbnail_data = None # Store the initially fetched thumbnail data
@@ -1022,16 +1099,14 @@ class YouTubeAlbumSplitterGUI:
         tracks_frame.columnconfigure(0, weight=1)
         tracks_frame.rowconfigure(0, weight=1)
         
-        # Buttons frame
+        # Buttons frame (for add/edit/delete)
         buttons_frame = ttk.Frame(tracks_frame)
         buttons_frame.grid(row=2, column=0, columnspan=2, pady=(10, 0))
         
         ttk.Button(buttons_frame, text="Add Track", command=self.add_track).grid(row=0, column=0, padx=(0, 5))
         ttk.Button(buttons_frame, text="Edit Track", command=self.edit_track).grid(row=0, column=1, padx=5)
         ttk.Button(buttons_frame, text="Delete Track", command=self.delete_track).grid(row=0, column=2, padx=5)
-        ttk.Button(buttons_frame, text="Preview", command=self.preview_track).grid(row=0, column=3, padx=5)
-        self.stop_preview_btn = ttk.Button(buttons_frame, text="Stop Preview", command=self.stop_preview)
-        self.stop_preview_btn.grid(row=0, column=4, padx=5)
+        # Removed "Preview" and "Stop Preview" buttons from here
         
         # Output frame (now row 5)
         output_frame = ttk.LabelFrame(main_frame, text="Output", padding="5")
@@ -1054,9 +1129,13 @@ class YouTubeAlbumSplitterGUI:
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(4, weight=1) # Tracks frame is row 4
 
-        self.player_controls = AudioPlayerControl(main_frame, self.preview)
+        # AudioPlayerControl is now instantiated with a reference to self (YouTubeAlbumSplitterGUI)
+        self.player_controls = AudioPlayerControl(main_frame, self)
         self.player_controls.grid(row=7, column=0, columnspan=2, pady=(10, 0), sticky=(tk.W, tk.E))
-    
+
+        # New: Bind track selection to the AudioPlayerControl
+        self.tracks_tree.bind('<<TreeviewSelect>>', self.on_track_selection)
+
     def download_and_analyse(self):
         url = self.url_var.get().strip()
         if not url:
@@ -1179,43 +1258,22 @@ class YouTubeAlbumSplitterGUI:
             del self.tracks[index]
             self.refresh_tracks_view()
     
-    def preview_track(self):
+    def on_track_selection(self, event):
+        """Called when a track is selected in the Treeview."""
         selection = self.tracks_tree.selection()
-        if not selection:
-            messagebox.showwarning("Warning", "Please select a track to preview")
-            return
-        
-        if not self.splitter.audio_file:
-            messagebox.showerror("Error", "No audio file available")
-            return
-        
-        item = selection[0]
-        index = self.tracks_tree.index(item)
-        track = self.tracks[index]
-        
-        def preview_thread():
-            try:
-                start_sec = self.splitter.parse_timestamp(track.start_time)
-                end_sec = self.splitter.parse_timestamp(track.end_time) if track.end_time else start_sec + 30
-                duration = end_sec - start_sec
-                
-                self.root.after(0, lambda: self.status_var.set("Creating preview..."))
-                
-                preview_file = self.preview.create_preview(self.splitter.audio_file, start_sec, duration)
-                if preview_file:
-                    self.preview.current_preview = preview_file
-                    self.preview.play_preview(preview_file)
-                    
-                    # Update player controls
-                    self.root.after(0, lambda: self.player_controls.set_duration(duration))
-                    self.root.after(0, lambda: self.player_controls.start_playback())
-                    self.root.after(0, lambda: self.status_var.set(f"Playing preview: {track.title}"))
-                else:
-                    self.root.after(0, lambda: messagebox.showerror("Error", "Failed to create preview"))
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Preview error: {e}"))
-        
-        threading.Thread(target=preview_thread, daemon=True).start()
+        if selection:
+            item = selection[0]
+            index = self.tracks_tree.index(item)
+            track = self.tracks[index]
+            self.player_controls.load_track_for_playback(track)
+            
+    # The original preview_track and stop_preview methods are no longer needed
+    # as their functionality is replaced by on_track_selection and player_controls.
+    # def preview_track(self):
+    #     pass # Removed/Replaced
+
+    # def stop_preview(self):
+    #     pass # Removed/Replaced
     
     def fetch_thumbnail(self):
         if not self.splitter.video_info:
@@ -1282,8 +1340,14 @@ class YouTubeAlbumSplitterGUI:
             initial_coords_to_pass = self.last_cropped_original_coords
 
         cropper = ThumbnailCropper(self.root, self.thumbnail_data, initial_crop_coords=initial_coords_to_pass)
-        self.root.wait_window(cropper) # Wait for cropper window to close
+        # Check if the cropper window is still alive before waiting on it
+        # This addresses the "bad window path name" error if the cropper dialog is closed prematurely by the user.
+        if cropper.winfo_exists():
+            self.root.wait_window(cropper) # Wait for cropper window to close
         
+        # The result attributes are set on the cropper instance itself before it's destroyed.
+        # We need to check if the attributes exist before trying to access them,
+        # in case the window was closed without explicit crop/cancel buttons being pressed.
         if hasattr(cropper, 'cropped_image_data') and cropper.cropped_image_data is not None:
             self.cropped_thumbnail_data = cropper.cropped_image_data
             self.last_cropped_original_coords = cropper.cropped_original_coords # Store the new original coords
@@ -1337,10 +1401,11 @@ class YouTubeAlbumSplitterGUI:
             self.thumbnail_label.image = None
 
 
-    def stop_preview(self):
-        self.player_controls.stop_playback()
-        self.preview.stop_preview()
-        self.status_var.set("Preview stopped")
+    # This method is now handled by player_controls.stop_playback(),
+    # and the old AudioPreview instance is removed.
+    # def stop_preview(self):
+    #     self.player_controls.stop_playback() # This will handle stopping pygame and temp files are cleaned
+    #     self.status_var.set("Preview stopped")
     
     def browse_output(self):
         directory = filedialog.askdirectory()
@@ -1386,7 +1451,7 @@ class YouTubeAlbumSplitterGUI:
                 self.root.after(0, lambda: self.progress.stop())
                 self.root.after(0, lambda: self.process_btn.config(state='normal'))
                 self.root.after(0, lambda: self.download_btn.config(state='normal'))
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Splitting failed: {e}"))
+                messagebox.showerror("Error", f"Splitting failed: {e}")
                 self.root.after(0, lambda: self.status_var.set("Splitting failed"))
             finally:
                 self.splitter.cleanup()
@@ -1406,7 +1471,7 @@ class YouTubeAlbumSplitterGUI:
 
     def on_closing(self):
         if messagebox.askokcancel("Quit", "Do you want to quit?"):
-            self.preview.stop_preview()
+            self.player_controls.stop_playback() # Ensure pygame mixer is stopped and temp files are cleaned
             self.splitter.cleanup()
             self.root.destroy()
 
