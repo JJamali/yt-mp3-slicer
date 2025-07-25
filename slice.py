@@ -16,14 +16,16 @@ from mutagen.id3 import ID3, APIC, TIT2, TALB, TPE1
 
 
 class Track:
-    def __init__(self, title: str, start_time: str, end_time: str = None):
+    def __init__(self, title: str, start_time: str, end_time: str = None, artist: str = None):
         self.title = title.strip()
         self.start_time = start_time
         self.end_time = end_time
+        self.artist = artist.strip() if artist else ""
     
     def __str__(self):
         end = f" - {self.end_time}" if self.end_time else ""
-        return f"{self.title}: {self.start_time}{end}"
+        artist_str = f" by {self.artist}" if self.artist else ""
+        return f"{self.title}{artist_str}: {self.start_time}{end}"
 
 class YouTubeAlbumSplitter:
     def __init__(self, root_gui): # Pass root_gui to access its attributes
@@ -250,12 +252,13 @@ class YouTubeAlbumSplitter:
                 
                 # Add metadata and thumbnail
                 if final_thumbnail_data:
-                    self.add_mp3_metadata(output_file, track.title, final_thumbnail_data)
+                    # Pass the track.artist to add_mp3_metadata
+                    self.add_mp3_metadata(output_file, track.title, track.artist, final_thumbnail_data)
                     
             except subprocess.CalledProcessError as e:
                 raise Exception(f"Failed to create {track.title}: {e.stderr.decode()}")
     
-    def add_mp3_metadata(self, filepath: str, title: str, thumbnail_data: bytes):
+    def add_mp3_metadata(self, filepath: str, title: str, artist: str, thumbnail_data: bytes):
         """Add ID3 tags and thumbnail to MP3 file with optional cropping"""
         try:
             audio = MP3(filepath, ID3=ID3)
@@ -278,7 +281,7 @@ class YouTubeAlbumSplitter:
             # Add basic metadata
             audio.tags.add(TIT2(encoding=3, text=title))  # Title
             audio.tags.add(TALB(encoding=3, text="YouTube Album"))  # Album
-            audio.tags.add(TPE1(encoding=3, text="Various Artists"))  # Artist
+            audio.tags.add(TPE1(encoding=3, text=artist))  # Artist (using the provided artist)
             
             audio.save()
         except Exception as e:
@@ -1098,9 +1101,18 @@ class YouTubeAlbumSplitterGUI:
         status_label = ttk.Label(main_frame, textvariable=self.status_var)
         status_label.grid(row=2, column=0, columnspan=2, pady=(0, 10))
 
+        # Artist Name input
+        artist_frame = ttk.LabelFrame(main_frame, text="Album Artist (Optional)", padding="5")
+        artist_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        self.artist_var = tk.StringVar(value="") # Initialize with empty string
+        artist_entry = ttk.Entry(artist_frame, textvariable=self.artist_var, width=60)
+        artist_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
+        artist_frame.columnconfigure(0, weight=1)
+
         # Thumbnail display area
         thumbnail_display_frame = ttk.LabelFrame(main_frame, text="Current Thumbnail", padding="5")
-        thumbnail_display_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        thumbnail_display_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         
         self.thumbnail_label = ttk.Label(thumbnail_display_frame)
         self.thumbnail_label.pack(side=tk.LEFT, padx=5, pady=5)
@@ -1109,19 +1121,24 @@ class YouTubeAlbumSplitterGUI:
         ttk.Button(thumbnail_display_frame, text="Change/Crop Thumbnail", command=self.change_crop_thumbnail).pack(side=tk.LEFT, padx=10)
 
 
-        # Tracks frame (now row 4)
+        # Tracks frame (shifted to row 5)
         tracks_frame = ttk.LabelFrame(main_frame, text="Tracks", padding="5")
-        tracks_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        tracks_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         
         # Treeview for tracks
-        columns = ('Title', 'Start', 'End', 'Duration')
+        # Updated columns to include 'Artist'
+        columns = ('Title', 'Artist', 'Start', 'End', 'Duration')
         self.tracks_tree = ttk.Treeview(tracks_frame, columns=columns, show='headings', height=15)
         
         for col in columns:
             self.tracks_tree.heading(col, text=col)
-            self.tracks_tree.column(col, width=150)
-        
-        self.tracks_tree.column('Title', width=300)
+            # Adjust column widths as needed
+            if col == 'Title':
+                self.tracks_tree.column(col, width=250)
+            elif col == 'Artist':
+                self.tracks_tree.column(col, width=150)
+            else:
+                self.tracks_tree.column(col, width=100)
         
         # Scrollbars for treeview
         v_scrollbar = ttk.Scrollbar(tracks_frame, orient=tk.VERTICAL, command=self.tracks_tree.yview)
@@ -1142,11 +1159,10 @@ class YouTubeAlbumSplitterGUI:
         ttk.Button(buttons_frame, text="Add Track", command=self.add_track).grid(row=0, column=0, padx=(0, 5))
         ttk.Button(buttons_frame, text="Edit Track", command=self.edit_track).grid(row=0, column=1, padx=5)
         ttk.Button(buttons_frame, text="Delete Track", command=self.delete_track).grid(row=0, column=2, padx=5)
-        # Removed "Preview" and "Stop Preview" buttons from here
         
-        # Output frame (now row 5)
+        # Output frame (shifted to row 6)
         output_frame = ttk.LabelFrame(main_frame, text="Output", padding="5")
-        output_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        output_frame.grid(row=6, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         
         self.output_var = tk.StringVar(value="output")
         ttk.Label(output_frame, text="Output Directory:").grid(row=0, column=0, sticky=tk.W)
@@ -1155,19 +1171,19 @@ class YouTubeAlbumSplitterGUI:
         
         output_frame.columnconfigure(1, weight=1)
         
-        # Process button (now row 6)
+        # Process button (shifted to row 7)
         self.process_btn = ttk.Button(main_frame, text="Split Audio", command=self.split_audio, state='disabled')
-        self.process_btn.grid(row=6, column=0, columnspan=2, pady=10)
+        self.process_btn.grid(row=7, column=0, columnspan=2, pady=10)
         
         # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(4, weight=1) # Tracks frame is row 4
+        main_frame.rowconfigure(5, weight=1) # Tracks frame is now row 5
 
         # AudioPlayerControl is now instantiated with a reference to self (YouTubeAlbumSplitterGUI)
         self.player_controls = AudioPlayerControl(main_frame, self)
-        self.player_controls.grid(row=7, column=0, columnspan=2, pady=(10, 0), sticky=(tk.W, tk.E))
+        self.player_controls.grid(row=8, column=0, columnspan=2, pady=(10, 0), sticky=(tk.W, tk.E))
 
         # New: Bind track selection to the AudioPlayerControl
         self.tracks_tree.bind('<<TreeviewSelect>>', self.on_track_selection)
@@ -1235,21 +1251,23 @@ class YouTubeAlbumSplitterGUI:
             
             self.tracks_tree.insert('', 'end', values=(
                 track.title,
+                track.artist, # New: Display artist
                 track.start_time,
                 track.end_time or "End",
                 duration
             ))
     
     def add_track(self):
-        dialog = TrackDialog(self.root, "Add Track")
+        # Pass the current album artist as initial_artist for new tracks
+        dialog = TrackDialog(self.root, "Add Track", initial_artist=self.artist_var.get())
         if dialog.result:
-            title, start_time, end_time = dialog.result
+            title, start_time, end_time, artist = dialog.result # New: Unpack artist
             try:
                 self.splitter.parse_timestamp(start_time)
                 if end_time:
                     self.splitter.parse_timestamp(end_time)
                 
-                self.tracks.append(Track(title, start_time, end_time))
+                self.tracks.append(Track(title, start_time, end_time, artist)) # New: Pass artist
                 self.tracks.sort(key=lambda t: self.splitter.parse_timestamp(t.start_time))
                 self.refresh_tracks_view()
             except ValueError as e:
@@ -1265,9 +1283,10 @@ class YouTubeAlbumSplitterGUI:
         index = self.tracks_tree.index(item)
         track = self.tracks[index]
         
-        dialog = TrackDialog(self.root, "Edit Track", track.title, track.start_time, track.end_time)
+        # Pass existing track's artist to the dialog
+        dialog = TrackDialog(self.root, "Edit Track", track.title, track.start_time, track.end_time, track.artist)
         if dialog.result:
-            title, start_time, end_time = dialog.result
+            title, start_time, end_time, artist = dialog.result # New: Unpack artist
             try:
                 self.splitter.parse_timestamp(start_time)
                 if end_time:
@@ -1276,6 +1295,7 @@ class YouTubeAlbumSplitterGUI:
                 track.title = title
                 track.start_time = start_time
                 track.end_time = end_time
+                track.artist = artist # New: Update artist
                 
                 self.tracks.sort(key=lambda t: self.splitter.parse_timestamp(t.start_time))
                 self.refresh_tracks_view()
@@ -1513,7 +1533,8 @@ class YouTubeAlbumSplitterGUI:
             self.root.destroy()
 
 class TrackDialog(tk.Toplevel):
-    def __init__(self, parent, title, initial_title="", initial_start="", initial_end=""):
+    # New: Added initial_artist parameter
+    def __init__(self, parent, title, initial_title="", initial_start="", initial_end="", initial_artist=""):
         super().__init__(parent)
         self.title(title)
         self.transient(parent)
@@ -1523,6 +1544,7 @@ class TrackDialog(tk.Toplevel):
         self.initial_title = initial_title
         self.initial_start = initial_start
         self.initial_end = initial_end
+        self.initial_artist = initial_artist # New: Store initial artist
         
         self.setup_ui()
         self.protocol("WM_DELETE_WINDOW", self.cancel)
@@ -1536,13 +1558,18 @@ class TrackDialog(tk.Toplevel):
         self.title_var = tk.StringVar(value=self.initial_title)
         ttk.Entry(form_frame, textvariable=self.title_var, width=40).grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5)
         
-        ttk.Label(form_frame, text="Start Time (mm:ss or hh:mm:ss):").grid(row=1, column=0, sticky=tk.W, pady=5)
+        # New: Artist field
+        ttk.Label(form_frame, text="Artist (optional):").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.artist_var = tk.StringVar(value=self.initial_artist)
+        ttk.Entry(form_frame, textvariable=self.artist_var, width=40).grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5)
+
+        ttk.Label(form_frame, text="Start Time (mm:ss or hh:mm:ss):").grid(row=2, column=0, sticky=tk.W, pady=5)
         self.start_var = tk.StringVar(value=self.initial_start)
-        ttk.Entry(form_frame, textvariable=self.start_var, width=20).grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5)
+        ttk.Entry(form_frame, textvariable=self.start_var, width=20).grid(row=2, column=1, sticky=(tk.W, tk.E), pady=5)
         
-        ttk.Label(form_frame, text="End Time (optional):").grid(row=2, column=0, sticky=tk.W, pady=5)
+        ttk.Label(form_frame, text="End Time (optional):").grid(row=3, column=0, sticky=tk.W, pady=5)
         self.end_var = tk.StringVar(value=self.initial_end)
-        ttk.Entry(form_frame, textvariable=self.end_var, width=20).grid(row=2, column=1, sticky=(tk.W, tk.E), pady=5)
+        ttk.Entry(form_frame, textvariable=self.end_var, width=20).grid(row=3, column=1, sticky=(tk.W, tk.E), pady=5)
         
         button_frame = ttk.Frame(self, padding="10")
         button_frame.pack(fill=tk.X)
@@ -1554,6 +1581,7 @@ class TrackDialog(tk.Toplevel):
 
     def ok(self):
         title = self.title_var.get().strip()
+        artist = self.artist_var.get().strip() # New: Get artist
         start_time = self.start_var.get().strip()
         end_time = self.end_var.get().strip()
         
@@ -1561,7 +1589,7 @@ class TrackDialog(tk.Toplevel):
             messagebox.showwarning("Input Error", "Title and Start Time are required.")
             return
         
-        self.result = (title, start_time, end_time if end_time else None)
+        self.result = (title, start_time, end_time if end_time else None, artist if artist else None)
         self.destroy()
 
     def cancel(self):
