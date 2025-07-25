@@ -964,16 +964,19 @@ class YouTubeAlbumSplitterGUI:
         # URL input
         url_frame = ttk.LabelFrame(main_frame, text="YouTube URL", padding="5")
         url_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-        
+
         self.url_var = tk.StringVar()
         url_entry = ttk.Entry(url_frame, textvariable=self.url_var, width=60)
         url_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
-        
+
+        # Bind Enter key to the button click
+        url_entry.bind("<Return>", lambda event: self.download_btn.invoke())
+
         self.download_btn = ttk.Button(url_frame, text="Download & Analyse", command=self.download_and_analyse)
         self.download_btn.grid(row=0, column=1)
-        
+
         url_frame.columnconfigure(0, weight=1)
-        
+
         # Progress bar
         self.progress = ttk.Progressbar(main_frame, mode='indeterminate')
         self.progress.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
