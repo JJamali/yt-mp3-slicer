@@ -1,6 +1,6 @@
 # yt-mp3-slicer
 
-I got tired of manually splitting MP3s from albums I could only find on youtube. 
+I got tired of manually splitting MP3s from albums I could only find on youtube. This is in bad need of a refactor.
 
 **Installation:**
 
